@@ -1,0 +1,5 @@
+L1-grow62K: prompt=61815 wall=49.0s
+X1-interleave40K: prompt=41415 wall=34.5s
+Y1-interleave28K: prompt=27815 wall=24.1s
+L2-return: prompt=62270 wall=51.7s
+TOTAL[off] wall=159.3s

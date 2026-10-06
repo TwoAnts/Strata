@@ -1,0 +1,72 @@
+load_hparams: Qwen-VL models require at minimum 1024 image tokens to function correctly on grounding tasks
+load_hparams: if you encounter problems with accuracy, try adding --image-min-tokens 1024
+load_hparams: more info: https://github.com/ggml-org/llama.cpp/issues/16842
+
+strata-vision: model files loaded in 1.2 s
+strata-vision: warmed up at 1024 image tokens in 0.7 s
+[strata] 2026-10-17 18:18:48 engine started: /home/hzy/code/Strata/engine-cuda12/strata --serve --pack /home/hzy/code/Strata-data/packs/iq3_s --native /home/hzy/models/Qwen3.8-Flash-Next-alesha-pro/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf --ple-gguf /home/hzy/models/Qwen3.8-Flash-Next-alesha-pro/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf --expert-profile /home/hzy/code/Strata/data/expert-profile.bin --expert-cache auto --prefill auto --spec 4 --batch-mtp --mtp /home/hzy/code/Strata-data/mtp/rt --max-context 204800 --kv fp16 --vision --vram-reserve-mib 960 --control-vector-scaled /home/hzy/models/Qwen3.8-Flash-Next-alesha-pro/Huihui-Qwen3.8-Flash-Next-refusal-direction-r.gguf:1.0 --control-vector-layer-range 4 44 --cvec-mode project --cvec-dir per-layer --kv-resident 32768 --prompt-cache-every 4096 --conversation-cache-mib 3500 --conversation-cache-slots 3 --conversation-cache-min-free-mib 4096 --conversation-cache-min-tokens 4096 --session-save-reclaim --pcie-frac 0.0 --spec-min-p 0.70 --prompt-cache 8 --slots 2
+strata generate: memory guard: limit 94.2 GiB (source: meminfo), current 2.7 GiB, reclaimable cache credited 0.0 GiB; available 91.5 GiB (MemAvailable 91.5 GiB), floor 4096 MiB
+strata generate: this CPU has no AVX-512: the expert kernels run on AVX-2 (multi-token for the i-quant gate/up rows)
+strata generate: native pack: /home/hzy/code/Strata-data/packs/iq3_s experts (largest blob 2.66 MB), token embedding IQ4_XS in mapped host memory (322 MiB, 0.5 s)
+strata generate: 1466 MiB of weights loaded from /home/hzy/code/Strata-data/packs/iq3_s in 0.8 s (302 canonical tensors skipped: served natively)
+strata generate: 300 native projection matrices, 2018.88 MiB of weights, in 1.0 s
+strata generate: control vector mode = project, dir = per-layer, layers 4..44 (41 steered)
+strata generate: PLE direct read probe: 113906 rows/s (fine)
+strata generate: the SSD is kept awake while rows are read: one page of the table after 100 ms without a read, until 60 s after the last request (STRATA_SSD_KEEPALIVE=0 turns it off)
+strata generate: profile /home/hzy/code/Strata/data/expert-profile.bin: 24576 ranked pairs, built for 24576 slots
+strata generate: KV streaming: 32768 of 204800 cells per QSA layer in VRAM, the K/V in 4.69 GiB of pinned RAM
+strata generate: PLE on, table 320001536 rows of /home/hzy/models/Qwen3.8-Flash-Next-alesha-pro/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf
+strata generate: --batch: 2 slot sessions on CUDA0 (1.21 GiB each); 22.66 GiB free
+strata generate: --batch 2: the slot sessions take 2.43 GiB of VRAM on CUDA0 that the expert cache would otherwise hold
+strata mtp: draft layer loaded, 866 MiB of VRAM (experts 675, dense 111), files read in 0.66 s (1197 MiB/s)
+strata mtp: shared draft weights, 81 MiB of private state and buffers
+strata mtp: shared draft weights, 81 MiB of private state and buffers
+strata generate: --batch-mtp: 2 slot drafters on CUDA0 (81 MiB of private K/V state and buffers each, sharing the solo drafter's weights); 21.64 GiB free there
+strata generate: experimental native Q5_K head, 521472000 bytes, in 0.2 s
+strata generate: GPU 0: Tesla V100-SXM2-32GB, compute capability 7.0
+strata generate: expert arena read through the file cache (buffered (not Windows))
+strata generate: expert arena: cudaHostRegister PORTABLE ok; MAP_HUGETLB unavailable (needed 23983 2 MiB pages, vm.nr_hugepages=0); transparent huge pages are on for every mapping (THP always): MADV_HUGEPAGE not requested
+strata generate: loaded 46.84 GiB at 2.50 GiB/s
+strata generate: GPU host-callback thread started before host-core pinning
+strata generate: CPU pool tasks/phase: 54 (automatic), participating threads: 18
+strata generate: 17 pool workers on logical processors 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17, the host thread on 0 (draining too) (--host-core first)
+strata aux cpus: threads that are neither pool workers nor the host go to CPUs 18 (off at start; a request's aux_cpus=1 turns it on)
+strata generate: expert cache auto: 21.06 GiB free, 960 MiB reserved (+230 MiB for the draft head) -> 8024 slots
+strata generate: expert cache 10484 slots, 19.90 GiB of VRAM; policy is
+strata generate: the GPU computes the experts in the cache; it rounds differently from the CPU,
+                 so a reply can differ slightly from a run without the cache (same quality:
+                 bench/results/2026-09-27-cache-parity).
+                 PROFILE, ranked by routing frequency, no eviction.
+strata generate: pre-filled 10484 of 10484 slots from the profile in 2.2 s (9598 MB/s); slot 0 verified
+strata generate: R4 hit path ON - resident experts are computed on the GPU
+strata generate: 17 expert-pool workers + the host thread
+strata generate: session is up (engine 0.1.45)
+strata generate: token graph hit path: 10484 resident experts, decided on the device
+strata serve: prompt chunk auto: 8192 tokens, a 384-slot ring
+strata serve: the prompt path borrows 2370 CUDA0 cache slots (4.51 GiB)
+strata hc: CUDA0: the hyper-connection read runs as staged (the norm per token and stream, the down projection's activations staged ahead by cp.async); checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 for the earlier ones)
+strata verify: window up to 8 tokens, 87.1 MiB of device buffers
+strata mtp: draft head over 106299 tokens (212.9 MiB)
+strata verify: batch windows of up to 2 sequences (layers [0, 48))
+strata serve: adaptive overlap signal: stream-ordered copies (STRATA_ADAPT_SIGNAL=host: a host function)
+strata serve: adaptive overlap (STRATA_ADAPT_OVERLAP=0 turns it off): the adaptive tier's copies land while the next window runs (same tokens, a layer waits for its own copies)
+strata serve: 733 MiB of VRAM free with everything loaded
+strata verify: capturing the 4-token window (635 MiB of VRAM free)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (619 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata serve: prompt 61815 tokens = 0 reused + 61815 read in 48867 ms (1265.0 tok/s), 1 generated in 42 ms (23.6 tok/s), drafts accepted 0 of 0, 8 checkpoints
+strata serve: decode expert cache hit rate: 75.6% (363 hits / 480 lookups)
+strata serve: KV streaming: 59.23% of 30804 block reads hit VRAM, 50.6 MiB read from RAM
+strata serve: conversation cache: parked 61815 tokens in 1209.7 ms; parked=1 bytes=2804726572 evictions=0 snapshot_bytes=2804726572 reused_kv_bytes=0
+strata serve: prompt 41415 tokens = 0 reused + 41415 read in 34389 ms (1204.3 tok/s), 1 generated in 24 ms (41.0 tok/s), drafts accepted 0 of 0, 6 checkpoints
+strata serve: decode expert cache hit rate: 75.6% (363 hits / 480 lookups)
+strata serve: KV streaming: 60.30% of 30804 block reads hit VRAM, 49.3 MiB read from RAM
+strata serve: conversation cache: parked 41415 tokens in 694.3 ms; parked=1 bytes=1993545948 evictions=1 snapshot_bytes=1993545948 reused_kv_bytes=0
+strata serve: prompt 27815 tokens = 0 reused + 27815 read in 24067 ms (1155.7 tok/s), 1 generated in 24 ms (41.1 tok/s), drafts accepted 0 of 0, 4 checkpoints
+strata serve: decode expert cache hit rate: 75.6% (363 hits / 480 lookups)
+strata serve: KV streaming: 61.96% of 30804 block reads hit VRAM, 47.2 MiB read from RAM
+strata serve: conversation cache: parked 27815 tokens in 549.7 ms; parked=2 bytes=3367584744 evictions=1 snapshot_bytes=1374038796 reused_kv_bytes=0
+strata serve: prompt 62270 tokens = 0 reused + 62270 read in 51669 ms (1205.2 tok/s), 1 generated in 25 ms (39.8 tok/s), drafts accepted 0 of 0, 8 checkpoints
+strata serve: decode expert cache hit rate: 75.6% (363 hits / 480 lookups)
+strata serve: KV streaming: 62.93% of 30816 block reads hit VRAM, 46.0 MiB read from RAM
