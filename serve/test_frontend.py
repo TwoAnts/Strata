@@ -101,3 +101,69 @@ class ForcedCallOpening(unittest.TestCase):
         self.assertTrue(forced_call("required", one).endswith("<function=a>\n"))
         self.assertTrue(forced_call("required", two).endswith("<function="))
         self.assertIsNone(forced_call("auto", one))
+
+
+class BacktickState(unittest.TestCase):
+    """The parser tracks the backtick runs that go out, so the serve can tell a quoted marker (one backtick
+    right before the stop token) from the token inside a ``` block, and an ordinary turn-end from both."""
+
+    def parser(self, thinking=True, delta=""):
+        from serve.frontend import OutputParser
+        p = OutputParser(thinking=thinking)
+        if delta:
+            p.feed(delta)
+        return p
+
+    def test_a_run_at_the_cursor(self):
+        self.assertEqual(self.parser(delta="the marker is `").tick_run, 1)
+        self.assertEqual(self.parser(delta="the marker is ``").tick_run, 2)
+        self.assertEqual(self.parser(delta="the marker is```").tick_run, 3)
+        self.assertEqual(self.parser(delta="the marker is `x").tick_run, 0)
+
+    def test_a_run_split_across_deltas_counts_once(self):
+        from serve.frontend import OutputParser
+        p = OutputParser(thinking=False)
+        for piece in ("the marker is", " `", "`"):
+            p.feed(piece)
+        self.assertEqual(p.tick_run, 2)
+
+    def test_a_block_toggles_on_its_own_delimiters(self):
+        self.assertEqual(self.parser(thinking=False, delta="text\n```\nstep").unclosed_code, "fence")
+        self.assertEqual(self.parser(thinking=False, delta="text\n```\nstep\n```\n").unclosed_code, "")
+        self.assertEqual(self.parser(thinking=False, delta="text\n```\nstep\n``").unclosed_code, "fence")
+
+    def test_the_thinking_region_counts_too(self):
+        self.assertEqual(self.parser(delta="a thought\n```\n").unclosed_code, "fence")
+
+    def test_a_single_run_is_not_a_block(self):
+        self.assertEqual(self.parser(thinking=False, delta="a `span` and `").unclosed_code, "")
+
+
+class QuotedMarkerShape(unittest.TestCase):
+    """The turn-end token is the marker being quoted only when the backtick right before it is *left over* on
+    its line - an unpaired opening backtick.  A backtick that closes a pair the model wrote itself is that pair's:
+    the token after it is the turn's own end (live 2026-10-06 21:18)."""
+
+    def parser(self, delta):
+        from serve.frontend import OutputParser
+        p = OutputParser(thinking=False)
+        p.feed(delta)
+        return p
+
+    def test_a_left_over_backtick_is_the_shape(self):
+        for text in ("the marker is `",            # nothing else on the line
+                     "the marker is `a` and `",    # a pair the model closed, then an opening one
+                     "the marker is\n`"):          # the line is only the opening backtick
+            with self.subTest(text=text):
+                self.assertTrue(self.parser(text).quoted_marker)
+
+    def test_a_closing_backtick_of_a_pair_is_not(self):
+        for text in ("the marker is `x`",
+                     "the marker is `<|im_end|>`",
+                     "`a` and `b`",
+                     "the marker is `x`\n`y`"):    # the last line's pair is closed too
+            with self.subTest(text=text):
+                self.assertFalse(self.parser(text).quoted_marker)
+
+    def test_a_pair_does_not_reach_across_a_line(self):
+        self.assertTrue(self.parser("opened `\nthe marker is `").quoted_marker)

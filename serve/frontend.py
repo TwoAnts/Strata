@@ -607,6 +607,16 @@ class OutputParser:
         self.rescued = 0             # calls delivered from the reasoning
         self.refused = 0             # declared calls kept as reasoning text (quoted, or the turn was cut)
         self.fence, self.line, self.ticks = "", "", 0
+        # The backticks of the text that goes out, read a second way and for another question (the serve reads them
+        # when a turn-end token arrives: see `quoted_marker` and `unclosed_code`).  `_track` above answers where the
+        # NEXT character would sit - a paragraph's backtick count, a fence opened at a line start - which cannot say
+        # what the character under the cursor is.  A run is counted when it ends, so one split across deltas counts
+        # once, and a run three or more long toggles a ``` block.  `_line_ticks` is the backticks of the line being
+        # written: pairs the model wrote are spans it closed, one left over is a span it has not - and a line ending
+        # forgets them (inline code in a reply stays on its line).
+        self._ticks = 0
+        self._line_ticks = 0
+        self._fence = False
         self._reset_scan()
 
     def _track(self, text: str) -> str:
@@ -774,7 +784,67 @@ class OutputParser:
                     best = max(best, n)
         return best
 
+    @property
+    def tick_run(self) -> int:
+        """How long the run of backticks the emitted text ends on is (0: it does not end on one).  The turn-end
+        token writes nothing, so 1 here *is* "one backtick immediately before the token".  (`ticks` is upstream's:
+        the backtick count of the current paragraph, which is where its NEXT character would sit - a different
+        question from what is under the cursor.)"""
+        return self._ticks
+
+    @property
+    def quoted_marker(self) -> bool:
+        """Whether the single backtick the emitted text ends on is *unpaired on its line*: the model opened a `span`
+        and has not closed it, so a turn-end token here is the marker it is quoting - the token's text cannot be
+        written any other way - and the `span` still needs its closing backtick.  A backtick that closes a pair the
+        model wrote itself (…`x` or …`<|im_end|>`, an even number of backticks on the line, which is how a marker
+        written as plain characters arrives) is that pair's closing backtick: the token after it is the turn's own
+        end, and writing the marker back would put a second copy in the reply (live 2026-10-06 21:18: a reply that
+        was "`<|im_end|>`" came back "`<|im_end|>`<|im_end|>` 是 …").  Pairs do not cross a line: markdown's grammar
+        does not require it, but inline code in a model's output stays on its line, and the line is what carries the
+        meaning."""
+        return self._ticks == 1 and self._line_ticks % 2 == 0
+
+    @property
+    def unclosed_code(self) -> str:
+        """`""` or `"fence"`: whether the emitted text is inside a ``` block (the run still being written counts as
+        if it ended here).  A turn that ends there ended inside code the model was writing, which a real end of turn
+        does not do.  Content and reasoning both count: code in a thought is code."""
+        fence = self._fence
+        if self._ticks >= 3:
+            fence = not fence
+        return "fence" if fence else ""
+
+    def _flush_ticks(self) -> None:
+        """A backtick run just ended: three or more toggle the ``` block, one or two are single backticks of the line
+        (a pair the model wrote stays paired; the serve only asks whether the one under the cursor is left over)."""
+        n, self._ticks = self._ticks, 0
+        if n >= 3:
+            self._fence = not self._fence
+        else:
+            self._line_ticks += n
+
+    def _note_code(self, out: list[Event]) -> list[Event]:
+        """Track the backticks in the text that goes out - the content *and* the reasoning region.  Tool arguments
+        stay out: a call body is protocol, not prose."""
+        for e in out:
+            if e.kind not in ("content", "reasoning"):
+                continue
+            for ch in e.text:
+                if ch == "`":
+                    self._ticks += 1
+                else:
+                    if self._ticks:
+                        self._flush_ticks()
+                    if ch == "\n":
+                        self._line_ticks = 0     # a span does not reach across the line
+        return out
+
     def feed(self, delta: str) -> list[Event]:
+        """The events for `delta`, with the backtick state of the text that goes out kept up to date."""
+        return self._note_code(self._feed(delta))
+
+    def _feed(self, delta: str) -> list[Event]:
         self.buf += delta
         out: list[Event] = []
         while True:
