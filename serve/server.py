@@ -65,6 +65,7 @@ from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 
 IM_END = "<|im_end|>"
+END_OF_TEXT = "<|endoftext|>"
 IMAGE_PAD = "<|image_pad|>"
 
 
@@ -142,10 +143,27 @@ VISION_START = "<|vision_start|>"
 # broken state that answers one token forever (an issue saw 36,689 tokens of "!"). The config's "repeat_stop_tokens"
 # sets it; 0 turns it off.
 REPEAT_STOP_TOKENS = 256
+# The reply quoting a stop token as text (see the stop branch in generate: one backtick right before the token, a
+# ``` block open around it, or a marker written inside the thinking): the token's text is written back as content and
+# the turn goes on from there.  One write-back is normally the whole fix; this bound is only so a reply that keeps
+# writing markers cannot hold the turn open forever (the runaway the continuation work saw live: one turn continued
+# 787 times into a repeated 14 KB reply).
+QUOTED_MARKER_MAX = 8
+# A reply that writes the *same* stop token this many times with no newline in between is repeating the marker, not
+# quoting it: at this count the write-back stops and the turn ends as it stands.  A newline resets the count - the
+# repetition is what is degenerate, and a reply that keeps quoting its markers one per line is not.
+QUOTED_MARKER_RUN_MAX = 4
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
 # #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token still inside <think>, with no answer
 # and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
 REASONING_CLOSE = "\n</think>\n\n"
+
+# the last pass when the same stop token repeats QUOTED_MARKER_RUN_MAX times while the thinking is still
+# open and nothing was answered: the turn does not end on the repetition - one final pass carries this
+# plain-text note, which says what happened and closes the thinking the way the budget's wrap-up does, so
+# the model answers instead of ending on its own marker again.  A pass after the note that ends the same
+# way ends the turn as it always did (run_hinted blocks a second note).
+RUN_HINT = "\n\nLet me continue thinking, and then give the final answer.\n"
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
 # #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
 # "reasoning_loop_recovery": "stop" ends the reply there; "recover" (or true) goes on from the same output with the
@@ -155,6 +173,7 @@ LOW_EFFORT = EFFORT_TEXT["low"]
 LOOP_CHECK_EVERY = 512           # output tokens between two looks at the reasoning (at a clean parser boundary)
 LOOP_COVERAGE = 0.25             # the share of the last 2,000 words inside 12-word passages seen three times
 LOOP_HISTORY_WORDS = 30000       # how far back the passages are counted (bounds the cost of a look)
+LOOP_TEXT_MAX = 240_000          # the reasoning text kept for a look (a tail: the detector reads its last words)
 
 
 def reasoning_repeat_coverage(text):
@@ -2509,6 +2528,19 @@ def stop_strings(req: dict) -> list[str]:
     return [x for x in stop if x]
 
 
+def stop_texts(tokenizer) -> dict[int, str]:
+    """The text each stop id stands for (the reverse of `Server.stop_ids`): the quoting shape's write-back needs the
+    token's own text to give it back to the reply.  The marker can never be *generated* as text - the tokenizer
+    matches the literal back to the very control token that ends the turn, so the turn stops before a character of
+    it is emitted - which is why the text has to be written back.  A stop id a config's own --eos-ids added is not
+    here: the shape then does not fire, and the turn ends as before."""
+    texts: dict[int, str] = {}
+    for text in (IM_END, END_OF_TEXT):
+        for t in tokenizer.encode(text, parse_special=True):
+            texts.setdefault(t, text)
+    return texts
+
+
 class StopMatcher:
     """Cuts the answer's text at the first stop string.  Text that could still be the start of a stop string is held
     back (only that tail, never more), so a stop string split across tokens or chunks is still found and never sent."""
@@ -2656,7 +2688,8 @@ class Service:
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
-                            tokenizer.encode("<|endoftext|>", parse_special=True))
+                            tokenizer.encode(END_OF_TEXT, parse_special=True))
+        self.stop_texts = stop_texts(tokenizer)          # each stop id's text (the quoting shape's write-back)
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
@@ -3437,6 +3470,11 @@ class Service:
                     out.append(Event("content", held))
                 out.append(ev)
             return out
+
+        def write_back(text: str):
+            """The quoted marker's text (and the backtick that closes its `span`, when that is the shape) as content
+            events: the token that stopped the turn could not emit a character of it itself."""
+            return cut(parser.feed(text))
         opening = []                                    # without thinking the prompt ends with the forced opening:
         if force and not thinking:                      # the parser reads it as if the model had written it
             opening, force = parser.feed(force), None
@@ -3444,6 +3482,10 @@ class Service:
         answered, close_retried = False, False          # #1053: content or a call came out; the thinking was closed
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
+        quotes = 0                                      # quoted markers written back and gone on from (bounded)
+        last_stop, stop_run = None, 0                   # the same stop token, written back again and again with
+        newline = True                                  # no newline in between (see QUOTED_MARKER_RUN_MAX)
+        run_hinted, hint_now = False, False             # the one hinted final pass at RUN_MAX
         looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
@@ -3495,6 +3537,8 @@ class Service:
                         recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
                         opens = False                   # the thinking is over: write the forced call's opening
+                        quoted = ""                     # the text written back: this pass ended on a quoted marker
+                        closed = False                  # the write-back also closes the `span` the marker sits in
                         try:
                             for t in gen:
                                 if t is None:               # heartbeat while the engine is quiet
@@ -3506,6 +3550,72 @@ class Service:
                                     with self.status_lock:
                                         trace["first_token_s"] = round(time.perf_counter() - trace["_clock"], 3)
                                 if t in self.stop_ids:
+                                    # The reply quoting a stop token as text.  A control token cannot be written
+                                    # any other way - the literal re-tokenizes to the token, so the turn stops before
+                                    # a character of it is emitted - which is why its text is written back and the
+                                    # turn goes on from there (below), the sentence finished rather than cut.  Three
+                                    # shapes, in this order (the first that fits wins):
+                                    #   1. one backtick left over on its line right before the token, "`<|im_end|>":
+                                    #      the model opened a `span` and has not closed it (a backtick that closes a
+                                    #      pair the model wrote itself is that pair's, not this shape), so the text
+                                    #      and the backtick that closes the span go back - and a space after them, so
+                                    #      the next pass goes on from a word boundary instead of writing that closing
+                                    #      backtick itself;
+                                    #   2. the token inside a ``` block open in the answer or in the thinking: the
+                                    #      text goes back and the block stays open for the model to finish;
+                                    #   3. the token inside the thinking with no code open: the text goes back and
+                                    #      the thinking goes on - a marker written mid-thought is a mention, and
+                                    #      ending the turn there answers nothing.  Thinking that repeats whole
+                                    #      passages is the exception: that is #728's loop, not a mention.
+                                    # An ordinary turn-end (the answer's own end, a call being written) is left
+                                    # alone: nothing is written back and the reply ends as the model said.  So is a
+                                    # stop token with nothing generated before it in this pass: after a write-back
+                                    # the model either goes on writing (a new quote may end that) or ends its turn,
+                                    # and its own end must not be read as one more quote.
+                                    quoted, closed = "", False
+                                    # #1058: a `<tool_call>` the model wrote inside its thinking waits in the
+                                    # parser until the turn shows whether it was an act, and this stop token is what
+                                    # settles it - so here the stop is an end, not a marker the thought quotes.
+                                    # In the thinking an empty seg is not taken as the model's own end: a stop
+                                    # right after a write-back there is the KV echoing the marker back (the thought
+                                    # is still open), so it goes on and QUOTED_MARKER_RUN_MAX is the backstop.
+                                    if (seg or parser.state == "reasoning") and parser.state in ("content", "reasoning") and not parser.pending:
+                                        text = self.stop_texts.get(t, "")
+                                        if text and parser.quoted_marker:
+                                            quoted, closed = text, True
+                                        elif text and (parser.unclosed_code or parser.state == "reasoning"):
+                                            # Shape 3's one exception: thinking that repeats whole passages is a
+                                            # loop running on until the model writes its own end, not a marker the
+                                            # thought mentions - #728's recovery and the thinking budget are the
+                                            # tools for it, and continuing it spends the rest of the output budget
+                                            # on another copy of the same words.
+                                            looping = (parser.state == "reasoning" and not parser.unclosed_code
+                                                       and reasoning_repeat_coverage(reasoning_text) >= LOOP_COVERAGE)
+                                            if not looping:
+                                                quoted = text
+                                    if quoted:
+                                        # the same token over and over with no newline between: the reply is not
+                                        # going on, it is repeating the marker, so past QUOTED_MARKER_RUN_MAX of
+                                        # them the turn ends there and nothing more is written back
+                                        stop_run = stop_run + 1 if t == last_stop and not newline else 1
+                                        last_stop = t
+                                        if stop_run >= QUOTED_MARKER_RUN_MAX and not (
+                                                parser.state == "reasoning" and not answered and not run_hinted):
+                                            print(f"[strata] the reply wrote {text} {stop_run} times with no newline "
+                                                  "in between: the turn ends there", flush=True)
+                                            finish, quoted, closed = "stop", "", False
+                                            raw_ids.append(t)
+                                            break
+                                        if stop_run >= QUOTED_MARKER_RUN_MAX:
+                                            # still thinking and nothing answered: one last pass, with a note that
+                                            # says what happened and asks for the answer (RUN_HINT)
+                                            run_hinted, hint_now = True, True
+                                            print(f"[strata] the reply wrote {text} {stop_run} times with no newline "
+                                                  "in between while still thinking: one last pass with a note to "
+                                                  "close the thinking and answer", flush=True)
+                                        newline = False     # the write-back adds no newline of its own
+                                        raw_ids.append(t)   # history ends on it, as on any clean stop
+                                        break
                                     finish = "stop"
                                     raw_ids.append(t)
                                     break
@@ -3519,12 +3629,18 @@ class Service:
                                     break
                                 piece = detok.push(t)
                                 tail = (tail + piece)[-2:]
+                                if "\n" in piece:
+                                    newline = True          # the same stop token's run is broken (see the stop branch)
                                 evs = cut(parser.feed(piece))
                                 self._note(n, evs, st, rate)
                                 last_print = self._progress(last_print, st=st)
                                 for ev in evs:
-                                    if self.reasoning_loop_recovery and ev.kind == "reasoning":
-                                        reasoning_text += ev.text or ""
+                                    if ev.kind == "reasoning":
+                                        # the thinking's text, kept for the repetition look: the #728 recovery and
+                                        # the stop branch below both read it (the stop branch checks it whether or
+                                        # not the recovery is on), and the detector only ever looks at the last
+                                        # LOOP_HISTORY_WORDS words, so a tail of it is enough
+                                        reasoning_text = (reasoning_text + (ev.text or ""))[-LOOP_TEXT_MAX:]
                                     if ev.kind in ("content", "tool_start", "tool_call"):
                                         answered = True
                                     yield "event", ev
@@ -3621,23 +3737,50 @@ class Service:
                                 prompt = prompt + seg + extra
                                 finish = "length"
                                 continue
-                        if not (wrap or opens) or cancel.is_set():
+                        if not (wrap or opens or quoted) or cancel.is_set():
                             break
                         # #123: the thinking reached reasoning_budget_tokens.  Close it the way the model would (a
                         # short wrap-up and </think>) and let it answer: the next pass's prompt is this one plus what
                         # was generated plus the wrap-up, so the engine continues from the prefix it already holds.
                         # A forced call (tool_choice) is opened the same way: after the wrap-up, or where the
                         # thinking ended, after the blank line the template puts before a call.
-                        if wrap:
-                            budget = None
-                            text = REASONING_WRAP_UP + (force or "")
+                        if quoted:
+                            # The quoted marker: its text (and, for the `span` shape, the backtick that closes the
+                            # span and a space) goes into the reply, and the prompt for the next pass carries it as
+                            # ordinary text (`plain`, #931's mechanism) - the literal spells the very control token
+                            # that just stopped the turn, so as a token it would end the next pass at the same place
+                            # and nothing after the quote could ever be written.
+                            text = quoted + ("` " if closed else "")
+                            if hint_now:
+                                text += RUN_HINT
+                                hint_now = False
+                            extra = self.tok.encode(text, parse_special=True, plain=[(0, len(text))])
+                            room = quotes < QUOTED_MARKER_MAX and max_new - n - len(extra) >= 1
                         else:
-                            text = "\n" * (2 - (len(tail) - len(tail.rstrip("\n")))) + force
-                        force = None
-                        extra = self.tok.encode(text, parse_special=True)
-                        if max_new - n - len(extra) < 1:
+                            if wrap:
+                                budget = None
+                                text = REASONING_WRAP_UP + (force or "")
+                            else:
+                                text = "\n" * (2 - (len(tail) - len(tail.rstrip("\n")))) + force
+                            force = None
+                            extra = self.tok.encode(text, parse_special=True)
+                            room = max_new - n - len(extra) >= 1
+                        if not room:
+                            if quoted:
+                                # no room to go on, or a reply that keeps quoting: the text is written back where it
+                                # stands and the turn ends there, so the answer is not cut inside the quote (and with
+                                # nothing after it, the closing shape does not need the space the continuation does)
+                                finish = "stop"
+                                for ev in write_back(text.rstrip()):
+                                    yield "event", ev
+                                print(f"[strata] the reply quoted {quoted}: its text was written back and the turn "
+                                      "ends there", flush=True)
                             break                       # no room left to answer: "length", as without a budget
-                        if wrap:
+                        if quoted:
+                            quotes += 1
+                            print(f"[strata] the reply quoted {quoted}: its text was written back and the turn goes "
+                                  f"on from there ({quotes})", flush=True)
+                        elif wrap:
                             print(f"[strata] thinking budget reached ({thought} tokens): wrapping up the thinking",
                                   flush=True)
                         for t in extra:
@@ -3648,6 +3791,8 @@ class Service:
                             self._note(n, evs, st, rate)
                             for ev in evs:
                                 yield "event", ev
+                        if quoted:
+                            tail = text[-2:]            # what the reply's text ends with now (the write-back)
                         if stops is not None and stops.hit is not None:
                             finish = "stop"
                             break
