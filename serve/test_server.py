@@ -22,9 +22,9 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate, literal_tags, mark_think_literals, unmark_think_literals  # noqa: E402
-from serve.server import (CTX_SLACK, ByteTokenizer, EngineDied, GpuBusy, MockEngine, PP_DONE_TAIL, Service,  # noqa: E402
-                          StrataEngine, api_key_of, engine_args, key_matches, layer_split_value, prompt_progress,
-                          prompt_tokens_seen,
+from serve.server import (CTX_SLACK, ByteTokenizer, EngineDied, GpuBusy, IM_END, MockEngine, PP_DONE_TAIL,  # noqa: E402
+                          QUOTED_MARKER_MAX, QUOTED_MARKER_RUN_MAX, Service, StrataEngine, api_key_of, engine_args,
+                          key_matches, layer_split_value, prompt_progress, prompt_tokens_seen,
                           request_timings, serve, start_failure_hint)
 from types import SimpleNamespace  # noqa: E402
 
@@ -3141,24 +3141,30 @@ class ReasoningCloseRetry(unittest.TestCase):
         self.httpd.server_close()
 
     def chat(self):
-        body = {"model": "m", "messages": [{"role": "user", "content": "2+2?"}], "max_tokens": 300}
+        body = {"model": "m", "messages": [{"role": "user", "content": "2+2?"}], "max_tokens": 600}
         req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=30) as r:
             return json.loads(r.read().decode())["choices"][0]
 
-    def test_off_by_default_the_reply_stays_empty(self):
+    def test_off_by_default_the_thinking_is_kept_going(self):
+        """The local patch's shape 3 fires first: a stop token inside the thinking is read as the
+        thought quoting the marker - its text is written back and the thinking goes on - so the turn
+        is continued instead of ending empty."""
         c = self.chat()
-        self.assertEqual(self.engine.prompts.__len__(), 1)
-        self.assertFalse(c["message"].get("content"))
+        self.assertGreater(len(self.engine.prompts), 1)          # continued, not ended on the first stop
+        self.assertIn("<|im_end|>", c["message"]["reasoning_content"])   # the marker went back as text
+        self.assertEqual(c["finish_reason"], "stop")
 
-    def test_on_it_closes_the_thinking_once_and_answers(self):
+    def test_on_it_the_local_continuation_wins(self):
+        """reasoning_close_retry (#1053) closes the thinking once; the local mechanism is already
+        there and never hands it the turn: the stop ends quoted, so #1053's finish == "stop" test
+        does not hold and the thinking continues with the marker's text instead."""
         self.svc.reasoning_close_retry = True
         c = self.chat()
-        self.assertEqual(len(self.engine.prompts), 2)
-        self.assertTrue(self.tok.decode(self.engine.prompts[1]).endswith("</think>" + chr(10) + chr(10)))
-        self.assertEqual(c["message"]["content"], EndsInsideThinkingEngine.ANSWER)
-        self.assertIn("two plus two is four", c["message"]["reasoning_content"])
+        self.assertGreater(len(self.engine.prompts), 1)
+        self.assertTrue(self.tok.decode(self.engine.prompts[1]).endswith("<|im_end|>"))  # the write-back, not REASONING_CLOSE
+        self.assertIn("<|im_end|>", c["message"]["reasoning_content"])
         self.assertEqual(c["finish_reason"], "stop")
 
     def test_a_reply_that_answered_is_not_touched(self):
@@ -4791,6 +4797,178 @@ class UntimedReads(unittest.TestCase):
         v = server.Vision.__new__(server.Vision)
         v.proc = SimpleNamespace(stdout=SimpleNamespace(readline=lambda: "OK 7 1 1 1\n"))
         self.assertEqual(v._readline(5.0, "x"), "OK 7 1 1 1\n")
+
+class QuotingEngine(MockEngine):
+    """Replays one script per pass: the first ends on the marker (the mock appends the end-of-turn token to every
+    script), the second the rest of the reply the model goes on with."""
+
+    FIRST = "The end-of-turn marker is `"
+    SECOND = "is what ends a turn."
+
+    def __init__(self, tok, scripts=None):
+        super().__init__(tok, [self.FIRST, self.SECOND] if scripts is None else scripts, max_context=CTX)
+        self.prompts = []
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.prompts.append(list(ids))
+        yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+
+class QuotedMarker(unittest.TestCase):
+    """A stop token the model wrote as text is the reply quoting the marker, not its turn ending.  A control
+    token's text can never be generated (the literal re-tokenizes to the token that stops the turn), so it is written
+    back as content and the turn goes on from there.  Three shapes, in this order: one backtick right before the token
+    (the text and the backtick that closes its `span` go back), the token inside an open ``` block, the token inside
+    the thinking."""
+
+    NO_THINKING = {"chat_template_kwargs": {"enable_thinking": False}}
+
+    def setUp(self):
+        self.tok = ByteTokenizer()
+        self.engine = QuotingEngine(self.tok)
+        self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.httpd = serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def ask(self, scripts=None, thinking=False):
+        """-> (choice, engine) of one request whose passes replay `scripts`."""
+        if scripts is not None:
+            self.engine = QuotingEngine(self.tok, list(scripts))
+            self.svc.engine = self.engine
+        body = {"model": "m", "messages": [{"role": "user", "content": "which marker ends a turn?"}],
+                "max_tokens": 400, **({} if thinking else self.NO_THINKING)}
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            b = json.loads(r.read())
+        return b["choices"][0], self.engine
+
+    def test_a_backtick_right_before_the_token_closes_the_quote(self):
+        for first in (QuotingEngine.FIRST, "The end-of-turn marker is`", "The end-of-turn marker is\n`"):
+            with self.subTest(first=first):
+                choice, engine = self.ask([first, QuotingEngine.SECOND])
+                self.assertEqual(choice["finish_reason"], "stop")
+                self.assertEqual(choice["message"]["content"], first + IM_END + "` " + QuotingEngine.SECOND)
+                prompt, second = engine.prompts
+                written = self.tok.encode(IM_END + "` ", parse_special=True, plain=[(0, len(IM_END) + 2)])
+                self.assertEqual(second, prompt + self.tok.encode(first) + written)
+                self.assertTrue(all(t < 256 for t in written))     # the marker stayed text, not the control token
+
+    def test_a_token_inside_an_open_block_is_written_back_alone(self):
+        first, second = "Here is the template:\n```\nstep one", "\n```\nThat is the template."
+        choice, engine = self.ask([first, second])
+        self.assertEqual(choice["finish_reason"], "stop")
+        self.assertEqual(choice["message"]["content"], first + IM_END + second)
+        self.assertEqual(len(engine.prompts), 2)                   # the block is left for the model to close
+
+    def test_a_token_in_the_thinking_is_written_back_and_the_thinking_goes_on(self):
+        first = "Let me think about the markers. "
+        choice, engine = self.ask([first, "</think>\n\nThe answer."], thinking=True)
+        self.assertEqual(choice["finish_reason"], "stop")
+        self.assertEqual(choice["message"]["reasoning_content"], first + IM_END)
+        self.assertEqual(choice["message"]["content"], "The answer.")
+        self.assertEqual(len(engine.prompts), 2)
+
+    def test_a_backtick_in_the_thinking_beats_the_thinking_shape(self):
+        """The shapes are read in order, and the first that fits wins: with the backtick the closing backtick goes
+        back too, even though the turn ended inside the thinking."""
+        first = "Let me quote it: `"
+        choice, _ = self.ask([first, "is the marker.</think>\n\nDone."], thinking=True)
+        self.assertEqual(choice["message"]["reasoning_content"], first + IM_END + "` " + "is the marker.")
+        self.assertEqual(choice["message"]["content"], "Done.")
+
+    def test_an_ordinary_turn_end_is_left_alone(self):
+        for first in ("The answer is 4.", "The answer is ``", "Two markers: `a` and `b` are control tokens."):
+            with self.subTest(first=first):
+                choice, engine = self.ask([first])
+                self.assertEqual((choice["finish_reason"], choice["message"]["content"]), ("stop", first))
+                self.assertEqual(len(engine.prompts), 1)           # the turn ended there, as it always did
+
+    def test_a_quote_the_model_already_wrote_is_left_alone(self):
+        """Live 2026-10-06 21:18: the model can write the marker as plain characters (nothing ends a turn for those),
+        and its own turn-end token then followed the closing backtick of that quote.  The quote is what it wrote, so
+        that token is the turn's own end: nothing is written back and the reply is not doubled."""
+        class Chars(QuotingEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                self.prompts.append(list(ids))
+                text = "The end-of-turn marker is `" + IM_END + "`"
+                for t in (self.tok.encode(text) + self.tok.encode(IM_END, parse_special=True))[:max_new]:
+                    yield t
+        self.engine = Chars(self.tok, ["x"])
+        self.svc.engine = self.engine
+        choice, engine = self.ask()
+        self.assertEqual(choice["finish_reason"], "stop")
+        self.assertEqual(choice["message"]["content"], "The end-of-turn marker is `" + IM_END + "`")
+        self.assertEqual(len(engine.prompts), 1)
+
+    def test_a_span_reopened_on_the_same_line_is_still_written_back(self):
+        """An odd backtick count on the line: the pair before the cursor is closed and the backtick under it opens
+        another span, so the marker is still to be written."""
+        first = "The end-of-turn marker `a` is `"
+        choice, _ = self.ask([first, QuotingEngine.SECOND])
+        self.assertEqual(choice["message"]["content"], first + IM_END + "` " + QuotingEngine.SECOND)
+
+    def test_a_turn_end_right_after_a_write_back_is_the_end(self):
+        """The pass after a write-back ends at once: the model wrote nothing, so that stop is its turn's end - the
+        marker is not written back a second time."""
+        choice, engine = self.ask([QuotingEngine.FIRST, ""])
+        self.assertEqual((choice["finish_reason"], choice["message"]["content"]),
+                         ("stop", QuotingEngine.FIRST + IM_END + "` "))
+        self.assertEqual(len(engine.prompts), 2)
+
+    def test_the_same_token_with_no_newline_stops_the_write_back(self):
+        """A reply that writes the same stop token again and again with no newline in between is repeating the
+        marker, not quoting it: at QUOTED_MARKER_RUN_MAX of them the write-back stops and the turn ends."""
+        choice, engine = self.ask([" `"])
+        self.assertEqual(choice["finish_reason"], "stop")
+        self.assertEqual(choice["message"]["content"], (" `" + IM_END + "` ") * (QUOTED_MARKER_RUN_MAX - 1) + " `")
+        self.assertEqual(len(engine.prompts), QUOTED_MARKER_RUN_MAX)
+
+    def test_the_run_end_while_still_thinking_gets_one_hinted_pass(self):
+        """At QUOTED_MARKER_RUN_MAX the thinking is still open and nothing was answered: the turn does not end
+        on the repetition - one final pass carries the note that closes the thinking and asks for the answer."""
+        choice, engine = self.ask([""] * QUOTED_MARKER_RUN_MAX + ["</think>\n\nThe answer."], thinking=True)
+        self.assertEqual(choice["finish_reason"], "stop")
+        self.assertEqual(len(engine.prompts), QUOTED_MARKER_RUN_MAX + 1)
+        self.assertEqual(choice["message"]["content"], "The answer.")
+        self.assertIn("continue thinking", choice["message"]["reasoning_content"])
+
+    def test_a_newline_between_them_resets_the_run(self):
+        """The repetition is what is degenerate: the same token one line apart is still written back, bounded by the
+        turn's own write-back cap instead."""
+        choice, engine = self.ask(["\n `"])
+        self.assertEqual(choice["finish_reason"], "stop")
+        self.assertEqual(choice["message"]["content"],
+                         ("\n `" + IM_END + "` ") * QUOTED_MARKER_MAX + "\n `" + IM_END + "`")
+        self.assertEqual(len(engine.prompts), QUOTED_MARKER_MAX + 1)
+
+    def test_thinking_that_repeats_is_not_a_quote(self):
+        """Shape 3's exception: thinking that repeats whole passages is #728's loop, not a marker the thought
+        mentions.  The turn ends where the model ended it - continuing a loop spends the rest of the output budget on
+        another copy of the same words (upstream's serve/test_reasoning_loop_recovery.py expects the one pass too)."""
+        loop = "Need maybe Agent support agent seven b. " * 300      # 2,100 words: past the detector's 2,000
+
+        class Counting(MockEngine):
+            def __init__(self, tok, script):
+                super().__init__(tok, [script], max_context=100000)
+                self.passes = 0
+
+            def generate(self, ids, max_new, sampling, cancel, **kwargs):
+                self.passes += 1
+                yield from super().generate(ids, max_new, sampling, cancel, **kwargs)
+
+        tok = ByteTokenizer()
+        engine = Counting(tok, loop)
+        svc = Service(engine, tok, None)
+        ids = tok.encode("<|im_start|>user\nSolve this<|im_end|>\n<|im_start|>assistant\n<think>\n",
+                         parse_special=True)
+        events = list(svc.run(ids, True, [], 40000, {}, threading.Event()))
+        self.assertEqual(engine.passes, 1)                    # one pass, as without the quoted-marker rescue
+        self.assertEqual(events[-1][1]["finish"], "stop")     # and the turn ended as the model ended it
 
 
 if __name__ == "__main__":
