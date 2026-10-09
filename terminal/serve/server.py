@@ -4459,6 +4459,7 @@ class Service:
         self.tool_markup_retry = os.environ.get("STRATA_TOOL_MARKUP_RETRY", "1").strip().lower() not in ("0", "off", "false", "no")
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
+        self.json_repair = 0                              # local patch: repair rounds for a failed json_object (0 = off)
         self.stop_ids = end_token_ids(tokenizer)
         self.hy4 = getattr(engine, "hy4_engine", False) is True      # the Hy4-Flash engine: its end tokens, its tagged texts that stay text in a message
         self.inkling = getattr(engine, "inkling_engine", False) is True   # the Inkling-2-Mini engine: its end tokens & channel tags
@@ -8421,6 +8422,23 @@ def make_handler(svc: Service):
             finally:
                 items.close()
 
+        def _openai_structured_repair(self, req, chunks, validator, messages, kw):
+            # local patch: validate the collected answer; on failure, show the model its broken answer and
+            # ask for a corrected one (serve/json_repair.py), up to svc.json_repair rounds, then the 502.
+            from serve.json_repair import repair_structured
+            result = openai_collect(chunks)
+            choice = result["choices"][0]
+            try:
+                choice["message"]["content"] = validated_json(choice["message"]["content"], validator,
+                                                                choice["finish_reason"])
+            except StructuredOutputError as e:
+                fixed = repair_structured(svc, req, messages, kw, validator, e,
+                                          choice["message"]["content"] or "", svc.json_repair)
+                if fixed is None:
+                    raise
+                result = fixed
+            return self._json(200, result)
+
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
             bias_api.normalize(req.get("logit_bias"), len(getattr(svc.tok, "tokens", ())) or None)
@@ -8479,6 +8497,8 @@ def make_handler(svc: Service):
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}) if use_mcp else None
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
+            if validator is not None and not req.get("stream") and svc.json_repair:
+                return self._openai_structured_repair(req, self._capture(chunks, "openai"), validator, messages, kw)
             if validator is not None:
                 chunks = structured_chunks(chunks, validator)
             chunks = self._capture(chunks, "openai")
@@ -9927,6 +9947,10 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
         raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
     svc.repeat_stop_tokens = rs
+    jr = cfg.get("json_repair", 0)                      # local patch serve/json_repair.py: 0 off, 1-3 repair rounds
+    if isinstance(jr, bool) or not isinstance(jr, int) or not 0 <= jr <= 3:
+        raise SystemExit(f"[strata] config \"json_repair\" must be a whole number 0-3 (0 = off), not {jr!r}")
+    svc.json_repair = jr
     svc.effort_end = bool(effort_end)                   # #458: "effort_position": "end" with an engine that has it
     if cfg.get("reasoning_budget_tokens") is not None:  # #123: a default thinking budget for every request
         svc.reasoning_budget_configured = True
