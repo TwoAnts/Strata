@@ -246,8 +246,9 @@ public:
         uint64_t serial = 0;   // the entry's identity; its index shifts when entries before it go
     };
 
-    ConversationCache(size_t budget, size_t slots, int64_t min_tokens = 0)
-        : budget_(budget), slots_(slots), min_tokens_(min_tokens) {}
+    ConversationCache(size_t budget, size_t slots, int64_t min_tokens = 0,
+                      int64_t idx_block = 0, bool park_truncate = false)
+        : budget_(budget), slots_(slots), min_tokens_(min_tokens), idx_block_(idx_block), park_truncate_(park_truncate) {}
     bool enabled() const { return budget_ != 0 && slots_ != 0; }
     /// `--conversation-cache-min-tokens`: whether a conversation of this length is worth one of `slots`.  Every
     /// parked conversation costs a whole slot whatever its length, so a client that interleaves short side requests
@@ -393,6 +394,11 @@ public:
         }
         if (bytes() > budget_ - held - incoming) reuse_ = {};
         while (!entries_.empty() && (entries_.size() >= slots_ || bytes_ > budget_ - held - incoming)) {
+            // byte pressure (the slot count is not one - truncation cannot shrink it): first try shrinking the
+            // oldest unpinned entry to one of its own checkpoints instead of losing it whole (see truncate_oldest)
+            if (entries_.size() < slots_ && bytes_ > budget_ - held - incoming &&
+                truncate_oldest(bytes_ - (budget_ - held - incoming)) > 0)
+                continue;
             // the oldest entry that does not hold a pinned shared prefix leaves; with only pinned ones left the new
             // image does not fit (the caller skips parking it - the pinned prefix is what the queries come back to)
             if (!evict_oldest()) return false;
@@ -416,6 +422,70 @@ public:
             return true;
         }
         return false;
+    }
+
+    // The eviction-side mirror of park truncation (STRATA_PARK_TRUNCATE): shrink the oldest unpinned entry to
+    // one of its own checkpoints instead of dropping it whole.  The prefix mirror stays: the K/V pages past the
+    // landing, the checkpoints at and deeper than it (the landing's running state MOVES into live) and their
+    // ids go.  A landing shallower than --conversation-cache-min-tokens is not worth a slot: the entry stays
+    // untouched and the caller evicts it whole.  The deepest landing that frees `need` wins; when none frees
+    // enough the deepest ones still go in (best effort - the caller re-checks admission and may truncate again
+    // or fall back to evict_oldest()).  0 = cannot truncate: no unpinned entry, no landing at or above the
+    // floor, a layer-split image, or a K/V layout the shrink does not recognize.
+    size_t truncate_oldest(size_t need) {
+        if (!park_truncate_ || idx_block_ <= 0) return 0;
+        size_t vi = entries_.size();
+        for (size_t i = 0; i < entries_.size(); ++i)
+            if (!entries_[i].pinned() && !(guarded_ != 0 && serials_[i] == guarded_)) { vi = i; break; }
+        if (vi == entries_.size()) return 0;
+        SavedConversation& victim = entries_[vi];
+        if (!victim.stage_images.empty()) return 0;
+        const size_t before = victim.bytes();
+        size_t freed = 0;
+        for (int ci = (int)victim.checkpoints.size() - 1; ci >= 0; --ci) {
+            if ((int64_t)victim.checkpoints[(size_t)ci].ids.size() < std::max<int64_t>(min_tokens_, 1)) break;
+            if (!truncate_entry(victim, (size_t)ci)) break;   // pre-checked: the entry is untouched at this depth
+            freed = before - victim.bytes();
+            if (freed >= need) break;
+        }
+        bytes_ -= freed;
+        return freed;
+    }
+
+    // Internal to truncate_oldest.  Shrink one image to checkpoints[ci]: K/V pages past the landing, the pooled
+    // rows past it, the checkpoints at and deeper than it (the landing's running state moves into live) and
+    // their ids go.  Every K/V extent is pre-checked before anything is touched, so a false return leaves the
+    // entry exactly as it was.
+    bool truncate_entry(SavedConversation& e, size_t ci) const {
+        const int64_t L = (int64_t)e.checkpoints[ci].ids.size();
+        for (const auto& kv : e.kv) {
+            if (kv.cells <= 0) continue;
+            const size_t old_cells = (size_t)kv.cells;
+            for (const ConversationBuffer* b : {&kv.k, &kv.v, &kv.k_scale, &kv.v_scale})
+                if (b->size() % old_cells) return false;   // not the cells-linear layout the shrink assumes
+            if (kv.pooled_rows > 0 && kv.pooled.size() % (size_t)kv.pooled_rows) return false;
+        }
+        for (auto& kv : e.kv) {
+            if (kv.cells <= 0) continue;
+            const size_t old_cells = (size_t)kv.cells;
+            const int64_t page = kv.page_size > 0 ? kv.page_size : 1;
+            const int64_t cells = ((L + page - 1) / page) * page;
+            for (ConversationBuffer* b : {&kv.k, &kv.v, &kv.k_scale, &kv.v_scale})
+                if (b->size()) b->resize(b->size() / old_cells * (size_t)cells);
+            if (kv.pooled_rows > 0 && kv.pooled.size()) {
+                const int64_t rows = L / idx_block_ + 1;   // the count layout() computes for a restore at L
+                kv.pooled.resize(kv.pooled.size() / (size_t)kv.pooled_rows * (size_t)rows);
+                kv.pooled_rows = rows;
+            }
+            kv.cells = cells;
+        }
+        ConversationCheckpoint& c = e.checkpoints[ci];
+        e.live.ids = std::move(c.ids); e.live.imgs = std::move(c.imgs);
+        e.live.gdn = std::move(c.gdn); e.live.ple = std::move(c.ple); e.live.tails = std::move(c.tails);
+        e.live.dead = std::move(c.dead); e.live.block_pos = std::move(c.block_pos);
+        e.live.used = c.used;
+        e.checkpoints.erase(e.checkpoints.begin() + (std::ptrdiff_t)ci, e.checkpoints.end());
+        return true;
     }
 
     // #879: every parked conversation (pinned ones too) and the retained K/V go - after non-finite logits any of them
@@ -532,6 +602,8 @@ private:
     }
     size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0, borrowed_ = 0;
     int64_t min_tokens_ = 0;   // --conversation-cache-min-tokens: 0 parks every conversation, whatever its size
+    int64_t idx_block_ = 0;    // the indexer's block (qsa_real_shapes): the pooled-row count at a truncated depth
+    bool park_truncate_ = false;   // STRATA_PARK_TRUNCATE: truncate_oldest is its eviction-side mirror
     std::deque<SavedConversation> entries_; // least recently active first
     std::deque<uint64_t> serials_;          // entries_[i]'s identity, never reused
     uint64_t next_serial_ = 1, guarded_ = 0;
