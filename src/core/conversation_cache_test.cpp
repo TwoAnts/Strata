@@ -744,6 +744,67 @@ int main() {
         // what drop_superseded does with the slot's chain (the park this rule prevents): the root goes
         check(cache.drop_superseded(slot_ids, {}, slot_chain, true) == 1 && cache.size() == 0,
               "the slot's chain supersedes the richer copy");
+        // the eviction-side mirror of park truncation: shrink the oldest unpinned entry to one of its own
+        // checkpoints instead of dropping it whole; a landing below --conversation-cache-min-tokens refuses
+        // untouched so the caller evicts whole; the switch off refuses too.
+        auto build = [](int seed) {
+            SavedConversation s;
+            s.live.ids.assign(40, seed);
+            s.live.gdn.resize(1000, 1);
+            ConversationKv kv;
+            kv.cells = 40; kv.page_size = 8; kv.pooled_rows = 6; kv.idx_dim = 4;
+            kv.k.resize(40 * 16, 3); kv.v.resize(40 * 16, 4);
+            kv.pooled.resize(6 * 4 * 4, 5);
+            s.kv.push_back(std::move(kv));
+            for (int64_t d : {16, 32}) {
+                ConversationCheckpoint ck;
+                ck.ids.assign((size_t)d, seed);
+                ck.gdn.resize(1000, 2);
+                s.checkpoints.push_back(std::move(ck));
+            }
+            return s;
+        };
+        ConversationCache c(1000000, 4, 10, 8, true);
+        check(c.put(build(5)), "a checkpointed conversation parks");
+        const size_t full = c.bytes();
+        check(c.truncate_oldest(full) > 0 && c.size() == 1,
+              "asked for more than any landing frees, the entry shrinks to the floor-deepest landings instead of going");
+        check(c.best(std::vector<int32_t>(40, 5), {}, true).tokens == 16,
+              "the landing's state became live: only the 16-token prefix is found now");
+        check(c.bytes() < full, "the tail pages, the deeper checkpoints and their ids left");
+        ConversationCache flr(1000000, 4, 33, 8, true);
+        check(flr.put(build(6)), "the same parks beside a higher min-tokens floor");
+        check(flr.truncate_oldest(1) == 0 && flr.size() == 1,
+              "every landing is below min-tokens: truncation refuses untouched, the caller evicts whole");
+        ConversationCache off(1000000, 4, 10, 8, false);
+        check(off.put(build(7)) && off.truncate_oldest(1) == 0 && off.size() == 1,
+              "with STRATA_PARK_TRUNCATE off truncation refuses and eviction stays as it was");
+        ConversationCache pin(1000000, 4, 0, 8, true);
+        auto s3 = build(8);
+        s3.checkpoints.back().pinned = true;
+        check(pin.put(std::move(s3)) && pin.truncate_oldest(1) == 0 && pin.size() == 1,
+              "a pinned entry is never truncated: same victim rule as eviction");
+        ConversationCache room((full * 15) / 8, 4, 10, 8, true);
+        check(room.put(build(9)) && room.put(build(10)), "the second parks after the oldest was shrunk, not dropped");
+        check(room.size() == 2 && room.best(std::vector<int32_t>(40, 9), {}, true).tokens == 32,
+              "byte pressure truncates the oldest before evicting it whole: the 32-token prefix still answers");
+        ConversationCache gdd(1000000, 4, 10, 8, true);
+        check(gdd.put(build(13)) && gdd.put(build(14)), "a borrowed-restore window: two conversations parked");
+        const int64_t d13 = gdd.best(std::vector<int32_t>(40, 13), {}, true).tokens;
+        const int64_t d14 = gdd.best(std::vector<int32_t>(40, 14), {}, true).tokens;
+        check(d13 > 0 && d14 > 0, "both parked conversations answer");
+        gdd.guard(gdd.best(std::vector<int32_t>(40, 13), {}, true).serial);
+        check(gdd.truncate_oldest(999999) > 0 &&
+              gdd.best(std::vector<int32_t>(40, 13), {}, true).tokens == d13 &&
+              gdd.best(std::vector<int32_t>(40, 14), {}, true).tokens < d14,
+              "the guarded donor is never truncated mid-restore (the ERR was: borrowed prefix outside the donor); the next entry shrinks");
+        gdd.unguard();
+        check(gdd.truncate_oldest(999999) > 0 && gdd.best(std::vector<int32_t>(40, 13), {}, true).tokens < d13,
+              "unguarded, the former donor can be truncated like any entry");
+
+        ConversationCache slotp(full * 4, 1, 10, 8, true);
+        check(slotp.put(build(11)) && slotp.put(build(12)) && slotp.size() == 1 && slotp.evictions() == 1,
+              "slot-count pressure still evicts whole: truncation cannot shrink a slot count");
     }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }
