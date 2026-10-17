@@ -12232,6 +12232,25 @@ int main(int argc, char** argv) {
                     } else {
                         live = bs[(size_t) slot_source].ids;
                     }
+                    // a batch slot carries at most one checkpoint of its conversation: the spread the read
+                    // laid along the chain survives only on the parked copy.  Hand those survivors back, or
+                    // every main-chain switch that returns through a slot starves the truncate-park ladder
+                    // and the next cross-slot mount down to a single point.  Text only for now: an empty
+                    // image list never matches a checkpoint that carries image keys.  STRATA_POOL_RESTORE=0
+                    // turns the return off.
+                    static const bool pool_restore = [] {
+                        const char* v = std::getenv("STRATA_POOL_RESTORE");
+                        return v == nullptr || std::atoi(v) != 0;
+                    }();
+                    if (pool_restore && !bs[(size_t) slot_source].img) {
+                        const size_t merged = conversations.merge_pool(
+                            ids, std::vector<strata::core::ConversationImageKey>{},
+                            bs[(size_t) slot_source].cvec, checks);
+                        if (merged)
+                            std::fprintf(stderr, "strata serve: conversation cache: returned %zu checkpoint(s) "
+                                         "of this conversation from the parked copy to the slot-mounted chain\n",
+                                         merged);
+                    }
                     live_imgs.clear();
                     resume = slot_tokens;
                     from_live = true;

@@ -266,6 +266,38 @@ public:
         return best;
     }
 
+    /// A conversation mounted through a batch slot comes back with only the checkpoint the
+    /// slot kept (typically one: its turn or endpoint).  The checkpoints spread along the chain
+    /// at read time are not lost - the parked copy of the same conversation still holds them.
+    /// Hand them back: from the most recently parked copy that has at least one checkpoint that
+    /// is a prefix of `prompt`, copy every prefix-compatible checkpoint whose depth the chain
+    /// does not already hold.  The `used` stamps travel with the copies, so the returned
+    /// survivors age from their last hit and the normal retention policy thins them again.
+    template<class Token>
+    size_t merge_pool(const std::vector<Token>& prompt,
+                      const std::vector<ConversationImageKey>& images, bool cvec,
+                      std::vector<ConversationCheckpoint>& into) const {
+        for (size_t i = entries_.size(); i-- > 0;) {
+            const auto& e = entries_[i];
+            if (e.cvec != cvec) continue;
+            std::vector<const ConversationCheckpoint*> give;
+            for (const auto& c : e.checkpoints)
+                if (conversation_prefix(c, prompt, images) > 0) give.push_back(&c);
+            if (give.empty()) continue;   // not this conversation's chain (no point of it is a prefix)
+            size_t added = 0;
+            for (const auto* c : give) {
+                bool dup = false;
+                for (const auto& k : into)
+                    if (k.ids.size() == c->ids.size()) { dup = true; break; }
+                if (dup) continue;
+                into.push_back(*c);
+                ++added;
+            }
+            return added;
+        }
+        return 0;
+    }
+
     SavedConversation take(size_t index) {
         SavedConversation out = std::move(entries_.at(index));
         bytes_ -= out.bytes();
