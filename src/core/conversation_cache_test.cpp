@@ -806,5 +806,23 @@ int main() {
         check(slotp.put(build(11)) && slotp.put(build(12)) && slotp.size() == 1 && slotp.evictions() == 1,
               "slot-count pressure still evicts whole: truncation cannot shrink a slot count");
     }
+    // merge_pool: the parked copy's spread checkpoints return to a slot-mounted chain
+    {
+        auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids = std::move(ids); return c; };
+        ConversationCache cache(1 << 20, 4);
+        SavedConversation e;
+        e.live = cp({1, 2, 3, 4, 5, 6, 7, 8});
+        e.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 5, 6})};
+        check(cache.put(std::move(e)), "merge_pool: the spread copy parks");
+        std::vector<ConversationCheckpoint> into = {cp({1, 2, 3, 4, 5, 6, 7, 8})};   // the slot's one point
+        const std::vector<int32_t> prompt = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+        check(cache.merge_pool(prompt, {}, true, into) == 2, "merge_pool: both spread points return");
+        check(cache.merge_pool(prompt, {}, true, into) == 0, "merge_pool: depths already held are not duplicated");
+        const std::vector<int32_t> diverged = {1, 2, 3, 99};
+        std::vector<ConversationCheckpoint> other = {cp({1, 2, 50})};
+        check(cache.merge_pool(diverged, {}, true, other) == 0, "merge_pool: a different chain merges nothing");
+        check(into.size() == 3, "merge_pool: the chain ends up with the full pool");
+    }
+
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }
