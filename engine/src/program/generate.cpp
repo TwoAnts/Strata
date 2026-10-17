@@ -1104,6 +1104,13 @@ struct Options {
     /// past the resume point - the client's stripped answer.  The park is a 6-8 GB copy on the follow-up's critical
     /// path (4.7-5.0 s at 460K); the suffix is re-read only if that branch is ever revisited.  0 = park, as before.
     int64_t conversation_cache_rewind_keep = 0;
+    /// STRATA_PARK_TRUNCATE=1: when a full snapshot cannot be admitted (the cache byte budget
+    /// or the physical-RAM floor), park the deepest checkpoint prefix that fits instead of dropping the
+    /// whole read: the mirror keeps root + chain + K/V up to that checkpoint, and the next request
+    /// re-reads only the tail instead of everything from the root (or token 0).  It is the switch for both
+    /// sides of the rule: an already-parked entry asked to make room is shrunk to one of its own checkpoints
+    /// before it is dropped whole (below --conversation-cache-min-tokens it goes whole).
+    bool conversation_cache_park_truncate = [] { const char* v = std::getenv("STRATA_PARK_TRUNCATE"); return v && v[0] && v[0] != '0'; }();
     /// --memory-limit-mib N / STRATA_MEMORY_LIMIT_MIB: the total RAM this engine's container or cgroup may use, for a
     /// container that cannot see its real limit (0 or unset = none; the flag wins over the variable)
     int64_t memory_limit_mib = -1;
@@ -13880,7 +13887,8 @@ int main(int argc, char** argv) {
         }
         strata::core::ConversationCache conversations(
             o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
-            (size_t) o.conversation_cache_slots, o.conversation_cache_min_tokens);
+            (size_t) o.conversation_cache_slots, o.conversation_cache_min_tokens,
+            strata::kernels::qsa_real_shapes().idx_block, o.conversation_cache_park_truncate);
         // The park pools (park_pool_policy.hpp): memory held idle between parks so a park does not pay the first touch of fresh pages.
         //   * the segment pool: one arena for the K/V buffers of parked conversations (STRATA_PARK_SEGPOOL_MIB=N sets its size, 0 turns it
         //     off; unset: min(2 GiB, a quarter of the cache); Linux only, the OS layer of Windows and macOS is not written yet: inert there);
@@ -14344,6 +14352,76 @@ int main(int argc, char** argv) {
                 }
                 stage_estimate += b;
             }
+            // local patch: truncated parking.  When the full snapshot cannot be admitted (byte budget or
+            // the physical-RAM floor), walk the checkpoint chain deepest-first and park the first prefix
+            // that fits: the parked copy keeps the chain up to that checkpoint, K/V [0, L), and mounts
+            // `live` on the checkpoint's own running state (the session's current state is deeper than L).
+            // The next request mounts the prefix and re-reads only the tail; a full skip re-reads from the
+            // root (or token 0) - the 225-second case a skip costs.  Single-stage only: the layer-split
+            // path parks one image per stage and has no per-checkpoint byte split to walk.  The below-
+            // min-tokens gate already passed for the full chain; a truncated copy may fall under it and is
+            // parked anyway - a root-deep mirror still saves the shared prefix.
+            auto park_truncated = [&]() -> bool {
+                if (!o.conversation_cache_park_truncate || n_st != 0 || checks.empty()) return false;
+                const auto t0_tr = Clock::now();
+                std::vector<ConvCheckpoint> checks_tr(checks.begin(), checks.end());   // walked deepest-first by shrinking
+                for (size_t j = checks.size(); j-- > 0; ) {
+                    const ConvCheckpoint& ck = checks[j];
+                    const int64_t L = (int64_t) ck.ids.size();
+                    if (L <= 0 || L >= (int64_t) live.size()) continue;   // not a truncation
+                    while (checks_tr.size() > j + 1) checks_tr.pop_back();
+                    std::vector<int32_t> ids_tr(live.begin(), live.begin() + (size_t) L);
+                    std::decay_t<decltype(live_imgs)> imgs_tr;
+                    for (const auto& k : live_imgs)
+                        if ((int64_t) k.start < L) imgs_tr.push_back(k);
+                    const strata::core::ConversationView v_tr{ids_tr, imgs_tr, checks_tr, cvec_cached};
+                    size_t est = 0;
+                    if (!strata::core::conversation_snapshot_bytes(v_tr, ss, g, draft0, est, err)) { err.clear(); continue; }
+                    if (!conversations.make_room(est, held)) continue;
+                    const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
+                    std::optional<strata::core::HostMemoryReading> mem;
+                    size_t evicted = 0;
+                    bool admit_ok = false;
+                    while (true) {
+                        mem = strata::core::sample_host_memory();
+                        admit_ok = strata::core::conversation_memory_admit(
+                            mem ? std::optional<uint64_t>(mem->available) : std::nullopt, est, floor);
+                        if (admit_ok) break;
+                        // the eviction-side mirror of park truncation: shrink the oldest parked entry to one of
+                        // its own checkpoints before losing it whole (0 = cannot, then it goes as it was)
+                        {
+                            const uint64_t avail = mem ? mem->available : 0;
+                            const size_t need = (uint64_t)est + floor > avail ? (size_t)((uint64_t)est + floor - avail) : 0;
+                            if (conversations.truncate_oldest(need) > 0) continue;
+                        }
+                        if (conversations.size() == 0 || evicted >= conversations.slots() ||
+                            !conversations.evict_oldest()) break;
+                        ++evicted;
+                    }
+                    if (!admit_ok) continue;
+                    strata::core::SavedConversation image;
+                    if (!strata::core::conversation_snapshot_save(image, v_tr, ss, g, draft0, err, {}, nullptr)) { err.clear(); continue; }
+                    // the session's current running state is deeper than L: mount live on the checkpoint's
+                    image.live.gdn = ck.gdn; image.live.ple = ck.ple; image.live.tails = ck.tails;
+                    image.live.dead = ck.dead; image.live.block_pos = ck.block_pos;
+                    const auto mem_after = strata::core::sample_host_memory();
+                    if (!strata::core::conversation_memory_admit(
+                            mem_after ? std::optional<uint64_t>(mem_after->available) : std::nullopt, 0, floor)) {
+                        std::fprintf(stderr, "strata serve: conversation cache: truncated park at %lld tokens "
+                                     "skipped (RAM floor after capture: %lld MiB needed, %s)\n",
+                                     (long long) L, (long long) o.conversation_cache_min_free_mib, ram_note(mem_after).c_str());
+                        continue;
+                    }
+                    const bool stored = conversations.put(std::move(image), held);
+                    std::fprintf(stderr, "strata serve: conversation cache: parked %lld tokens (truncated from %zu) "
+                                 "in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu\n",
+                                 (long long) L, live.size(),
+                                 std::chrono::duration<double, std::milli>(Clock::now() - t0_tr).count(),
+                                 conversations.size(), conversations.bytes(), conversations.evictions(), image.bytes());
+                    return stored;
+                }
+                return false;
+            };
             size_t estimate = 0;
             if (!strata::core::conversation_snapshot_bytes(view, src.session, g, draft0, estimate, err)) {
                 std::fprintf(stderr, "strata serve: conversation cache: skip parking (%s)\n", err.c_str());
@@ -14365,6 +14443,7 @@ int main(int argc, char** argv) {
             // capacity and directories, and put() charges that same true size -
             // a capped figure would under-evict and overfill the budget.
             if (!conversations.make_room(estimate, held)) {
+                if (park_truncated()) return true;
                 std::fprintf(stderr, "strata serve: conversation cache: skip parking (snapshot %zu MiB exceeds available budget)\n",
                              estimate >> 20);
                 return true;
@@ -14401,6 +14480,17 @@ int main(int argc, char** argv) {
                 // bytes the reading does not show (the C library kept them) stops the loop, and the rest stay parked.
                 // An evicted image's segments go back to the segment pool as idle (resident) memory: given back to the
                 // OS at once, or the reading could never show them.
+                if (!fits) {
+                    // the eviction-side mirror of park truncation: shrink the oldest parked entry to one
+                    // of its own checkpoints before it would go whole (STRATA_PARK_TRUNCATE)
+                    for (;;) {
+                        const uint64_t avail = mem ? mem->available : 0;
+                        const size_t need = (uint64_t) additional + floor > avail ? (size_t)((uint64_t)additional + floor - avail) : 0;
+                        if (conversations.truncate_oldest(need) == 0) break;
+                        fits = admit();
+                        if (fits) break;
+                    }
+                }
                 bool no_progress = false;
                 std::string cannot_help_note;   // #2253: the refusal line's note when no eviction could have made room
                 if (!fits) {
@@ -14431,6 +14521,7 @@ int main(int argc, char** argv) {
                     }
                 }
                 if (!fits) {
+                    if (park_truncated()) return true;
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked%s%s)\n",
                                  additional >> 20, (long long) o.conversation_cache_min_free_mib, ram_note(mem).c_str(),
                                  evicted, conversations.size(),
