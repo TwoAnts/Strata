@@ -542,6 +542,13 @@ LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often (#1619)
 
 
+# the traffic-class table (serve/class_profile.py): one knob, STRATA_CLASS_POLICY - 0 off (nothing is
+# built, the request path pays nothing), 1 watch + the engine skips parking dead classes, 2 the engine
+# also orders cache sacrifice by class (include 1).  Any nonzero level records the table and reports it
+# in GET /metrics' classes section.  Module level because the engine client tags GEN lines with it too,
+# and there is exactly one per process anyway.  Read once at import: a restart switch.
+CLASS_PROFILE = None
+CLASS_POLICY = max(0, min(2, int(os.environ.get("STRATA_CLASS_POLICY", "0") or 0)))
 # #4271: a streaming client that stops reading (a hung process, a network that dropped) leaves the thread that writes to
 # it blocked once the socket buffers are full - and that thread holds the engine's turn.  A write that makes no progress
 # for this long ends the request as a disconnect (the engine is stopped, the turn given back).  0: no limit, as before.
@@ -1512,6 +1519,15 @@ class StrataEngine:
             return ""
         return f" pen_from={orig_len - 1}"
 
+    def cls_suffix(self, prompt) -> str:
+        """STRATA_CLASS_POLICY>=1: tag the request with its traffic family's class (cls=0 established
+        one-shot / 1 unknown or growing / 2 proven reuse) so the engine parks by class.  No table or
+        policy 0: no key, the request is exactly as before.  Engines before the cls key skip unknown keys,
+        so a new serve against an old engine is equally as before."""
+        if CLASS_PROFILE is None or CLASS_POLICY < 1:
+            return ""
+        return f" cls={CLASS_PROFILE.priority(prompt)}"
+
     @staticmethod
     def sampling_keys(sampling: dict, *, hy4: bool = False, inkling: bool = False) -> str:
         keys = ""
@@ -2288,7 +2304,7 @@ class StrataEngine:
                         self.slot_prompt[0] = list(prompt)
                         solo_leg = (list(prompt), len(out), self.gen)
                     pf = self.pen_from_key(orig_len, len(prompt))
-                    head = f"GENI {left}{leg_keys()}{pf} {embeddings}" if embeddings else f"GEN {left}{leg_keys()}{pf}"
+                    head = f"GENI {left}{leg_keys()}{pf} {embeddings}" if embeddings else f"GEN {left}{leg_keys()}{pf}{self.cls_suffix(prompt)}"
                     self._last_done = None                  # (#879: this request's DONE decides below)
                     deadline = getattr(cancel, "_strata_queue_deadline", None)
                     if deadline is not None and time.monotonic() >= deadline:
@@ -2825,7 +2841,7 @@ class StrataEngine:
         carry = NO_LINE                  # a line read for a token's LP line, held until it is used
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {}, hy4=getattr(self, 'hy4_engine', False), inkling=getattr(self, 'inkling_engine', False))} {embeddings}" if embeddings else \
-            f"GEN {int(max_new)}{self.sampling_keys(sampling or {}, hy4=getattr(self, 'hy4_engine', False), inkling=getattr(self, 'inkling_engine', False))}"
+            f"GEN {int(max_new)}{self.sampling_keys(sampling or {}, hy4=getattr(self, 'hy4_engine', False), inkling=getattr(self, 'inkling_engine', False))}{self.cls_suffix(ids)}"
         if prefill_only:                                 # split serving (serve/split.py): read the prompt, make no token
             if embeddings or int(max_new) != 0:
                 raise ValueError("prefill_only is a text prompt and max_new 0")
@@ -4482,6 +4498,17 @@ class Service:
         self.api_requests = collections.deque(maxlen=100)  # bounded I/O in memory; no headers or API keys
         self.request_trace = threading.local()
         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
+        # the traffic-class profile (serve/class_profile.py): STRATA_CLASS_POLICY 1/2 - every GEN line
+        # carries the family's class, the engine refuses to park dead classes (and at 2 also sacrifices
+        # them first); the classes section of GET /metrics watches the table live.  0: path pays nothing.
+        self.class_profile = None
+        if CLASS_POLICY >= 1:
+            from serve.class_profile import ClassProfile
+            self.class_profile = ClassProfile(decode=lambda ids: self.tok.decode(ids),
+                                              cap=int(os.environ.get("STRATA_CLASS_PROFILE_MAX", "128")),
+                                              path=os.environ.get("STRATA_CLASS_PROFILE_PATH", ""))
+            global CLASS_PROFILE
+            CLASS_PROFILE = self.class_profile
         # since the server started (the Monitor's totals, issue #35)
         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
                        "prompt_ms": 0.0, "decode_ms": 0.0,
@@ -5573,7 +5600,9 @@ class Service:
             engine["vision_note"] = self.vision.cpu_note
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
-        return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
+        return {"engine": engine, "live": live, "classes": self.class_profile.snapshot()
+                if self.class_profile is not None else None,
+                "requests": hist[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
@@ -6878,6 +6907,8 @@ class Service:
                                 t["prompt_tokens"] += seen
                                 t["reused"] += last.get("reused") or 0
                                 t["output_tokens"] += n
+                                if self.class_profile is not None:
+                                    self.class_profile.record(ids, last.get("reused"), len(ids))
                                 t["prompt_ms"] += last.get("prompt_ms") or 0.0
                                 t["decode_ms"] += last.get("decode_ms") or 0.0
                                 t["drafts_offered"] += last.get("drafts_offered") or 0
@@ -9934,6 +9965,16 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
             delay_s=getattr(a, "script_delay", 0.0) or 0.0), None, {}
     # the model's own chat template (exported with its tokenizer), else the original model's
     tpl = tpath / "chat_template.jinja"
+    # the run config's env block feeds the ENGINE's environment; the traffic-class switches (serve/class_profile.py)
+    # must be visible to serve itself too, and the unit should not carry a knob that lives in the run config:
+    # mirror it into our own environment and re-read CLASS_POLICY (import-time, before the config was in hand)
+    for _k in ("STRATA_CLASS_POLICY", "STRATA_CLASS_PROFILE_MAX", "STRATA_CLASS_PROFILE_PATH"):
+        _v = (cfg.get("env") or {}).get(_k)
+        if _v is not None:
+            os.environ[_k] = str(_v)
+    global CLASS_POLICY
+    CLASS_POLICY = max(0, min(2, int(os.environ.get("STRATA_CLASS_POLICY", "0") or 0)))
+
     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
                   model_name=default_model_name(cfg), vision=vision,
                   sampling_defaults=sampling_defaults,
