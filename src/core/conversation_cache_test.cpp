@@ -22,6 +22,8 @@ SavedConversation image(std::initializer_list<int32_t> ids, bool cvec = true) {
 }
 
 int main() {
+    setenv("STRATA_CLASS_POLICY", "2", 1);   // the class-ordered cases below; every other test parks
+                                            // cls=1 entries, where class order IS age order (all tie)
     {
         ConversationBuffer bytes;
         const size_t first = ConversationBuffer::segment_bytes + 17;
@@ -152,6 +154,19 @@ int main() {
         check(cache.size() == 0 && cache.bytes() == 0, "evicting the last parked conversation empties the cache");
         check(!cache.evict_oldest(), "the gate's loop can reach an empty cache: false");
         check(cache.size() == 0 && cache.evictions() == 2, "evict_oldest on an empty cache is a no-op");
+    }
+    {   // STRATA_CLASS_POLICY=2 sacrifice order: the dead-class conversation goes first even though the
+        // proven-reuse one is older - the fork chains squeezing the daily chain out is the pathology
+        ConversationCache cache(4096, 4);
+        SavedConversation warm = image({1, 2, 3});
+        warm.cls = 2;
+        SavedConversation dead = image({9, 8, 7});
+        dead.cls = 0;
+        cache.put(std::move(warm));   // the older entry
+        cache.put(std::move(dead));
+        check(cache.evict_oldest(), "class-ordered evict_oldest reports an eviction");
+        check(cache.best(a, {}, true).tokens == 3 && cache.best(b, {}, true).tokens == 0,
+              "the dead-class entry went, the older proven-reuse entry stayed");
     }
     {   // the RAM gate's eviction skips a conversation that holds a pinned shared prefix, and says so (false)
         ConversationCache cache(1 << 20, 4);
