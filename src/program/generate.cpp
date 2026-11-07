@@ -12038,6 +12038,12 @@ int main(int argc, char** argv) {
         };
         // What a park captures: the main session's conversation (park_current) or an idle batch slot's (park_slot:
         // the reply it decoded, before an admission overwrites it).  One budget / admission / snapshot path for both.
+        // STRATA_CLASS_POLICY (serve/class_profile.py): the traffic class serve tags requests with
+        // (cls=0 known one-shot / 1 unknown or growing / 2 proven reuse).  park_cls is the class of the
+        // conversation THIS session currently runs - the one a park is about to save - and it rotates
+        // once the new request's keys are read, so a parked image never carries the class of the
+        // request that merely triggered the park.  Main-session parks only: batch-slot requests share it.
+        int park_cls = 1, next_park_cls = 1;
         struct ParkSource {
             const std::vector<int32_t>& ids;
             const std::vector<ImgKey>& imgs;
@@ -12099,6 +12105,14 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: conversation cache: skip parking (%zu tokens, below the %lld "
                                      "minimum; parked=%zu)\n",
                              src.ids.size(), (long long) o.conversation_cache_min_tokens, conversations.size());
+                return true;
+            }
+            // STRATA_CLASS_POLICY=1: serve's table has seen this family five or more times and it has never
+            // reused its prompt - parking those chains spends budget and slots the proven-reuse chains need.
+            if (conversations.class_policy() >= 1 && park_cls == 0) {
+                std::fprintf(stderr, "strata serve: conversation cache: skip parking (%zu tokens, a class serve "
+                                     "saw repeatedly and never reused; parked=%zu)\n",
+                             src.ids.size(), conversations.size());
                 return true;
             }
             // #342: before make_room evicts oldest-first, the copies of this conversation a turn back go (they hold
@@ -12299,6 +12313,7 @@ int main(int argc, char** argv) {
                                  evicted, evicted == 1 ? "" : "s", additional >> 20,
                                  (long long) o.conversation_cache_min_free_mib);
                 strata::core::SavedConversation image;
+                image.cls = park_cls;   // sacrifice order follows the class (STRATA_CLASS_POLICY=2)
                 size_t reused_bytes = 0;
                 // STRATA_CKPT_POOL: the running state and the checkpoint copies go into dropped checkpoints' vectors
                 // (the ones this request drops refill the pool right after); what is left goes back
@@ -15827,6 +15842,8 @@ int main(int argc, char** argv) {
             std::string req_draft;   // draft=mtp|dflash2 (--draft auto): which drafter this request uses
             bool req_min_p_set = false;
             double req_pipe = -1.0;   // --prefill-pipe for this request (setup's calibration of a layer split)
+            park_cls = next_park_cls;   // the class of the conversation being left (see park_source)
+            int req_cls = 1;   // cls=0|1|2: this conversation's traffic class as scored by serve
             int req_aux_cpus = -1;   // aux_cpus=0|1: --aux-cpus for this request (-1 = the start-up value)
             // #2228: img_keys=<hex>,<hex>,... (GENI): each picture's key from the server (its normalized bytes' hash),
             // in prompt order.  With them the conversation cache matches a picture by its key and grid, not by its
@@ -15877,6 +15894,7 @@ int main(int argc, char** argv) {
                     else if (key == "draft") req_draft = tok.substr(eq + 1);
                     else if (key == "pipe") req_pipe = std::max(0.0, (double) fv);
                     else if (key == "aux_cpus") req_aux_cpus = std::atoi(tok.c_str() + eq + 1) != 0 ? 1 : 0;
+                    else if (key == "cls") req_cls = std::clamp(std::atoi(tok.c_str() + eq + 1), 0, 2);
                     else if (key == "img_keys") {
                         req_img_keys.clear();
                         const char* q = tok.c_str() + eq + 1;
@@ -15893,6 +15911,7 @@ int main(int argc, char** argv) {
                 }
             }
             strata::prefill::Prefill::set_pipe_request(req_pipe);   // every request sets it: none carries over
+            next_park_cls = req_cls;   // the class the next park carries
             bool req_df2 = use_df2;   // --draft auto: this request's drafter, decided once the prompt is parsed (below)
             std::vector<float> req_bias;
             std::string bias_error;
