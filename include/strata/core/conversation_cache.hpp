@@ -8,6 +8,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <deque>
 #include <memory>
 #include <utility>
@@ -187,6 +188,10 @@ struct SavedConversation {
     std::shared_ptr<void> pending;
     // STRATA_CKPT_ASYNC: the same for the background copy that fills `live.gdn` (the park's running state)
     std::shared_ptr<void> live_pending;
+    // STRATA_CLASS_POLICY: the serve-side traffic class of this conversation (0 = a class known to
+    // never come back, 1 = unknown/growing (the default), 2 = proven reuse).  It parks with the image:
+    // evict_oldest() sacrifices dead-class entries first under policy=2, age only breaks the tie.
+    int cls = 1;
 
     /// Holds a pinned shared prefix (see ConversationCheckpoint::pinned): the parked-conversation budget keeps it.
     bool pinned() const {
@@ -411,6 +416,18 @@ public:
     size_t borrowed() const { return borrowed_; }
     void count_borrow() { ++borrowed_; }
 
+    // STRATA_CLASS_POLICY (see serve/class_profile.py): 0 = off, age-first sacrifice (as always).
+    // 1 = the park path in generate.cpp refuses to park a conversation served by a known-dead class
+    // (cls=0); 2 = evict_oldest() additionally sacrifices dead-class entries before proven-reuse ones,
+    // age breaking ties.  Read once: a switch for a restart, not for flipping mid-run.
+    static int class_policy() {
+        static const int p = [] {
+            const char* e = std::getenv("STRATA_CLASS_POLICY");
+            return e ? std::max(0, std::min(2, std::atoi(e))) : 0;
+        }();
+        return p;
+    }
+
     // Reserve before allocating a snapshot. held is an incoming image removed
     // with take() but still alive during the exchange; count it against RAM too.
     bool make_room(size_t incoming, size_t held = 0) {
@@ -445,15 +462,22 @@ public:
     // to the kernel at once - the next admission check reads it back from /proc/meminfo.
     // False when none can go (empty, or only entries that hold a pinned shared prefix are left).
     bool evict_oldest() {
-        // the oldest entry that holds no pinned shared prefix and is not the guarded (borrowed) donor
+        // the oldest entry that holds no pinned shared prefix and is not the guarded (borrowed) donor;
+        // with STRATA_CLASS_POLICY=2 the traffic class goes first: the family that never returns is
+        // sacrificed before the family that proves reuse every day, whatever their ages (and the age
+        // order is untouched when no entry carries a class - every default cls is the same value)
+        const bool by_class = class_policy() >= 2;
+        size_t pick = SIZE_MAX;
         for (size_t i = 0; i < entries_.size(); ++i) {
             if (entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
-            bytes_ -= entries_[i].bytes();
-            erase(i);
-            ++evictions_;
-            return true;
+            if (pick == SIZE_MAX || (by_class && entries_[i].cls < entries_[pick].cls)) pick = i;
+            if (!by_class) break;   // age-first: the first eligible entry in list order, as always
         }
-        return false;
+        if (pick == SIZE_MAX) return false;
+        bytes_ -= entries_[pick].bytes();
+        erase(pick);
+        ++evictions_;
+        return true;
     }
 
     // The eviction-side mirror of park truncation (STRATA_PARK_TRUNCATE): shrink the oldest unpinned entry to
