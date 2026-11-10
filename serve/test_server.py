@@ -4279,6 +4279,133 @@ class ReasoningCloseRetry(unittest.TestCase):
         self.assertEqual(c["message"]["reasoning_content"], 'two plus two is "4"')
 
 
+class UndeclaredBackfill(unittest.TestCase):
+    """The local STRATA_UNDECLARED_BACKFILL patch: a reply that ends on a call of an undeclared name whose
+    name is exactly one `_word` longer than exactly one declared tool gets that name rewritten in the call's
+    own opener, and the model goes on from the name - the arguments and the closer stay the model's writing.
+    With the patch off (the default) the #3441 behaviour stands: the call text is the answer."""
+
+    from serve.frontend import CALL_END, CALL_START   # this template's call region markers (as in #3075)
+    CALL = (CALL_START + "\n<function=read_file>\n<parameter=path>\na.txt\n</parameter>\n"
+            "</function>\n" + CALL_END + "\n")
+    FIRST = "Looking.\n\n" + CALL   # a thinking-off reply: prose, then a call of an undeclared name
+    CONTINUE = ("\n<parameter=path>\na.txt\n</parameter>\n</function>\n" + CALL_END +
+                "\n")   # what the model goes on to write once the corrected opener was handed back to it
+
+    class BackfillEngine(MockEngine):
+        """The first pass writes the call of the undeclared name and stops; every later pass writes the
+        engine's NEXT - what the model goes on from the corrected name (by default: the call's parameters)."""
+        NEXT = None
+
+        def __init__(self, tok):
+            super().__init__(tok, "x", max_context=CTX)
+            self.prompts = []
+            self.passes = 0
+            self.FIRST = UndeclaredBackfill.FIRST
+
+        def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+            self.prompts.append(list(ids))
+            text = self.FIRST if self.passes == 0 else (self.NEXT or UndeclaredBackfill.CONTINUE)
+            self.passes += 1
+            for tok in (self.tok.encode(text) + self.tok.encode("<|im_end|>", parse_special=True))[:max_new]:
+                if cancel.is_set():
+                    return
+                yield tok
+
+    def setUp(self):
+        self.tok = ByteTokenizer()
+        self.engine = self.BackfillEngine(self.tok)
+        self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.svc.undeclared_backfill = 1
+        self.httpd = serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def chat(self, tools=("terminal", "write_file", "read")):
+        body = {"model": "m", "messages": [{"role": "user", "content": "read a.txt"}], "max_tokens": 600,
+                "chat_template_kwargs": {"enable_thinking": False},   # the reply shape below assumes thinking off
+                "tools": [{"type": "function",
+                           "function": {"name": n, "description": n,
+                                        "parameters": {"type": "object", "properties": {}}}} for n in tools]}
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode())["choices"][0]
+
+    def test_off_by_default_the_call_folds_into_text(self):
+        self.svc.undeclared_backfill = 0
+        c = self.chat()
+        self.assertEqual(len(self.engine.prompts), 1)
+        self.assertEqual(c["finish_reason"], "stop")
+        self.assertIn("<function=read_file>", c["message"]["content"])   # the plain #3441 answer: text as written
+
+    def test_the_name_is_backfilled_and_the_model_goes_on_from_it(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            c = self.chat()
+        self.assertEqual(len(self.engine.prompts), 2)
+        self.assertTrue(self.tok.decode(self.engine.prompts[1]).endswith("<function=read>"))
+        self.assertEqual(c["finish_reason"], "tool_calls")
+        self.assertEqual(c["message"]["tool_calls"][0]["function"]["name"], "read")
+        self.assertIn("a.txt", c["message"]["tool_calls"][0]["function"]["arguments"])
+        self.assertEqual(c["message"]["content"].strip(), "Looking.")     # the folded wrong call never reached the client
+        self.assertNotIn("read_file", c["message"]["content"])
+        self.assertIn("the name was backfilled to read", out.getvalue())
+        self.assertNotIn("did not read as a call", out.getvalue())        # a corrected fold is not reported as rejected
+
+    def test_two_declared_names_fit_the_server_keeps_its_hands_off(self):
+        self.engine.FIRST = self.FIRST.replace("read_file", "read_all_file")
+        c = self.chat(tools=("read", "read_all", "terminal"))
+        self.assertEqual(len(self.engine.prompts), 1)                     # ambiguous: no rewrite, the fold stands
+        self.assertEqual(c["finish_reason"], "stop")
+        self.assertIn("<function=read_all_file>", c["message"]["content"])
+
+    def test_a_suffix_that_is_not_a_word_is_no_clue(self):
+        self.engine.FIRST = self.FIRST.replace("read_file", "listen")
+        c = self.chat(tools=("list", "terminal"))                         # "listen" starts with "list" with no separator
+        self.assertEqual(len(self.engine.prompts), 1)
+        self.assertEqual(c["finish_reason"], "stop")
+        self.assertIn("<function=listen>", c["message"]["content"])
+
+    def test_only_a_single_folded_call_may_be_backfilled(self):
+        self.engine.FIRST = "Looking.</think>\n\n" + self.CALL + self.CALL
+        c = self.chat()
+        self.assertEqual(len(self.engine.prompts), 1)                     # two folded calls: whose region is the held text? let the fold answer
+        self.assertEqual(c["finish_reason"], "stop")
+        self.assertEqual(c["message"]["content"].count("read_file"), 2)
+
+    def test_a_request_without_declared_tools_has_nothing_to_backfill(self):
+        c = self.chat(tools=())
+        self.assertEqual(len(self.engine.prompts), 1)
+        self.assertEqual(c["finish_reason"], "stop")
+        self.assertIn("<function=read_file>", c["message"]["content"])
+
+    def chat_history_call(self):
+        """A history assistant turn already called read_file - does #4663's history rescue still leave it undeclared?"""
+        body = {"model": "m", "max_tokens": 600,
+                "messages": [{"role": "user", "content": "read a.txt"},
+                             {"role": "assistant", "content": None,
+                              "tool_calls": [{"id": "c1", "type": "function",
+                                              "function": {"name": "read_file", "arguments": "{}"}}]},
+                             {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+                             {"role": "user", "content": "read it again"}],
+                "tools": [{"type": "function", "function": {"name": "terminal", "description": "t",
+                                                             "parameters": {"type": "object", "properties": {}}}}]}
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode())["choices"][0]
+
+    def test_a_name_the_history_already_called_is_rescued_and_never_backfilled(self):
+        c = self.chat_history_call()
+        self.assertEqual(len(self.engine.prompts), 1)          # #4663 rescues it: declared, no fold, no rewrite
+        self.assertEqual(c["finish_reason"], "tool_calls")
+        self.assertEqual(c["message"]["tool_calls"][0]["function"]["name"], "read_file")
+
+
 class ThinkingBudget(unittest.TestCase):
     """#123: reasoning_budget_tokens (opt-in): at the budget the thinking is wrapped up and the model answers,
     continuing from the prompt plus what it generated plus the wrap-up (a prefix the engine already holds)."""

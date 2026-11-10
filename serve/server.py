@@ -60,7 +60,7 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages, anthropic_tools,  # noqa: E402
+from serve.frontend import (THINK_END, CALL_START, ChatTemplate, Event, OutputParser, anthropic_to_messages, anthropic_tools,  # noqa: E402
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
@@ -245,6 +245,39 @@ REASONING_CLOSE = "\n</think>\n\n"
 # the model answers instead of ending on its own marker again.  A pass after the note that ends the same
 # way ends the turn as it always did (run_hinted blocks a second note).
 RUN_HINT = "\n\nNeed continue thinking carefully.\n"
+# Local patch, the undeclared-name backfill (env STRATA_UNDECLARED_BACKFILL=1, or =2 for at most two a turn):
+# when a Chat Completions reply ends on a well-formed call of a name the request did not declare (#3441) and
+# that name is exactly one `_word` longer than exactly ONE declared tool - the ecosystem prior writing
+# "read_file" where the toolset says "read" - the server does not guess across the list and does not spend a
+# round asking: it cuts the folded call out of the stream while the turn is still open, writes the model's
+# own opener back with the declared name in its place, and lets the model go on from the name.  Everything
+# the model then writes (arguments, the closer, any prose) is conditioned on the corrected name, and the
+# correction can only fire where exactly one reading fits: two declared names that both fit ("read" and
+# "read_only" under a written "read_file") leave the server mute and the plain #3441 fold stands.  Off by
+# default - strict parsing stays the baseline - and the undeclared_tool_calls config (#4622) still disposes
+# of anything the patch did not settle.
+def undeclared_backfill_setting(value=None) -> int:
+    """env STRATA_UNDECLARED_BACKFILL, or the serve config's "undeclared_backfill" (the env wins when set):
+    "" off (the default), "1" at most one correction, "2" at most two."""
+    v = str(os.environ.get("STRATA_UNDECLARED_BACKFILL") or value or "").strip().lower()
+    return 2 if v == "2" else (1 if v == "1" else 0)
+
+
+UNDECLARED_BACKFILL_MAX = undeclared_backfill_setting()
+
+# The opener the model wrote for the folded call, read back off the held text: `<function=NAME>` with the
+# name in its own group (the whitespace groups are the template's own, kept when the name is replaced).
+_BACKFILL_OPENER = re.compile(r"(<function=\s*)([^\s<>]+)(\s*>)")
+
+
+def _backfill_target(wrong: str, names) -> str | None:
+    """The backfill candidate: the ONE declared name `wrong` can only have meant - `wrong` is that name plus a
+    `_word` (or `-word`) suffix, the shape of a habit, not of a random edit.  None when none fits or two fit:
+    where a second reading exists the server keeps its hands off the model's output."""
+    hits = [d for d in names if wrong != d and len(wrong) > len(d)
+            and wrong.lower().startswith(d.lower()) and wrong[len(d)] in "_-"]
+    return hits[0] if len(hits) == 1 else None
+
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
 # #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
 # "reasoning_loop_recovery": "stop" ends the reply there; "recover" (or true) goes on from the same output with the
@@ -4838,6 +4871,7 @@ class Service:
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.answer_room = True                       # 0.1.45: see ANSWER_ROOM_MIN_CAP (the config's "answer_room": false turns it off)
         self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends inside it
+        self.undeclared_backfill = 0                    # env STRATA_UNDECLARED_BACKFILL (local patch): 1 = a folded call whose name is exactly one `_word` longer than one declared tool is rewritten at the name and the model goes on from it; 2 = at most twice a turn; 0 = off
         self.codex_compaction_cache = False           # #924 (opt-in): a Codex compaction is rendered with its conversation's tools
         self.codex_thread_titles = False              # #923 (opt-in): answer Codex's thread-title turns without the engine
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
@@ -6315,6 +6349,26 @@ class Service:
         parser = self.parser_cls(thinking=thinking, tools=with_history_tools(tools, sampling), stream_tools=True,
                                  recover=self.tool_call_recovery, declared_only=declared_only,
                                  deferred=deferred or self.undeclared_tool_calls == "call")   # #4622: opt-in, as for a deferred tool
+        # local patch (diagnostics): a thin counting wrapper over this request's parser, so the rejection
+        # warning can say whether a rescued turn went on to complete a call of a declared name anyway -
+        # that is the difference between "the model corrected itself" and "the model repeated the mistake".
+        # The backfill patch keeps its own counter beside it (parser.backfills, written at each correction).
+        _feed, _finish = parser.feed, parser.finish
+        parser.calls = 0
+        parser.backfills = 0                            # local backfill patch: corrections this request was given
+        _tallying = [False]
+        def _count(evs):
+            parser.calls += sum(1 for e in evs if e.kind == "tool_call")
+            return evs
+        def _feed_c(text):
+            return _count(_feed(text)) if not _tallying[0] else _feed(text)
+        def _finish_c(reason=None):
+            _tallying[0] = True          # finish() calls self.feed("") inside: count its events once, from here
+            try:
+                return _count(_finish(reason))
+            finally:
+                _tallying[0] = False
+        parser.feed, parser.finish = _feed_c, _finish_c
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
@@ -6353,6 +6407,9 @@ class Service:
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
         quotes = 0                                      # quoted markers written back and gone on from (bounded)
+        backfill_acted = 0                              # the undeclared-name backfills used this turn (local patch)
+        fold_buf, fold_at, fold_txt = [], None, ""      # local backfill patch: the held text of a folded call, and where its tokens start
+        fold_ok, fold_mark, fold_mode = True, False, False   # whether a correction can apply / this pass folded / the run is holding text
         last_stop, stop_run = None, 0                   # the same stop token, written back again and again with
         newline = True                                  # no newline in between (see QUOTED_MARKER_RUN_MAX)
         run_hinted, hint_now = False, False             # the one hinted final pass at RUN_MAX
@@ -6473,7 +6530,12 @@ class Service:
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
                         recover_prompt = None
+                        fold_at, fold_txt, fold_mark = None, "", False   # a pass that folds starts a fold region of its own (local patch)
+                        for ev in fold_buf:             # text a previous pass held and nothing claimed (local patch; normally empty - a backfilled pass empties it itself)
+                            yield "event", ev
+                        fold_buf = []
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
+                        seg_text = []                           # local backfill patch: what every token of seg wrote (the fold cut is a text position)
                         nonfinite = False               # #879: the engine ended this pass on non-finite logits
                         opens = False                   # the thinking is over: write the forced call's opening
                         quoted = ""                     # the text written back: this pass ended on a quoted marker
@@ -6585,6 +6647,7 @@ class Service:
                                     repeated = True     # #606: a degenerate output, not an answer: end it here
                                     break
                                 piece = detok.push(t)
+                                seg_text.append(piece)          # local backfill patch: the text ledger behind seg
                                 tail = (tail + piece)[-2:]
                                 if "\n" in piece:
                                     newline = True          # the same stop token's run is broken (see the stop branch)
@@ -6592,7 +6655,46 @@ class Service:
                                 self._note(n, evs, st, rate)
                                 last_print = self._progress(last_print, st=st)
                                 for ev in evs:
-                                    if ev.kind == "reasoning":
+                                    if (self.undeclared_backfill and getattr(ev, "folded", None)
+                                            and fold_at is None and not fold_mark):
+                                        # local backfill patch, the fold hook: the parser just folded a call of an
+                                        # undeclared name (#3441).  Its event text is the prose the parser held back
+                                        # plus the `<tool_call>` that opened the call: the prose is flushed with its
+                                        # ids (it is text, already paid for), the opener starts the fold region the
+                                        # run holds out of the stream - the call's whole rest comes to this generator
+                                        # as plain content until the pass ends, and the pass-end hook below either
+                                        # corrects the name and continues the turn or releases the held text.
+                                        ftxt, fcut = ev.text or "", (ev.text or "").rfind(CALL_START)
+                                        fold_mark = True
+                                        if fcut >= 0:
+                                            fold_at, fold_txt, fold_mode = len(seg), ftxt[fcut:], True
+                                            fold_buf = [ev]        # the opener joins the held text, not the stream
+                                            pit = ftxt[:fcut]
+                                            if pit:
+                                                ev.text = ftxt[fcut:]   # the event keeps only the opener; the prose goes out now
+                                            for t2 in self.tok.encode(pit, parse_special=True,
+                                                                      plain=[(0, len(pit))]) if pit else ():
+                                                n += 1
+                                                raw_ids.append(t2)
+                                            for ch in ftxt[fcut:]:  # the opener's ids: the fold point cuts in front of them
+                                                for t2 in self.tok.encode(ch, parse_special=True, plain=[(0, 1)]):
+                                                    n += 1
+                                                    raw_ids.append(t2)
+                                            if pit:
+                                                yield "event", Event("content", pit)
+                                            continue
+                                        fold_ok = False              # not the shape this patch can cut: an ordinary fold
+                                    if fold_mode:                    # held region text: the ids already advanced at
+                                        if ev.kind == "content":     # the token level; the events wait for the hook
+                                            fold_buf.append(ev)
+                                            continue
+                                        else:                        # thinking or a call after the folded one: the folded
+                                            fold_ok = False          # call was not the reply's last act after all
+                                            fold_mode = False
+                                            for held in fold_buf:
+                                                yield "event", held
+                                            fold_buf = []
+                                    elif ev.kind == "reasoning":
                                         # the thinking's text, kept for the repetition look: the #728 recovery and
                                         # the stop branch below both read it (the stop branch checks it whether or
                                         # not the recovery is on), and the detector only ever looks at the last
@@ -6728,6 +6830,58 @@ class Service:
                                 prompt = prompt + seg + extra
                                 finish = "length"
                                 continue
+
+                        if (self.undeclared_backfill and declared_only and self.undeclared_tool_calls == "text"
+                                and fold_ok and fold_at is not None and finish == "stop" and tools
+                                and not cancel.is_set() and (stops is None or stops.hit is None)):
+                            # Local backfill patch (env STRATA_UNDECLARED_BACKFILL), the pass-end hook: a pass
+                            # ended on a folded call of an undeclared name, its text held out of the stream.  If
+                            # that name is exactly one `_word` longer than exactly ONE declared tool - and this
+                            # turn folded exactly one call, so the held text is that call and nothing else - the
+                            # server rewrites the model's own opener with that tool's name, hands the corrected
+                            # opener back to the parser, and continues the turn: the arguments, the closer and the
+                            # rest of the reply stay the model's own writing, now conditioned on the name the
+                            # request really declared.  The fold text's token cut must land on a token boundary;
+                            # a call whose opener shares a token with prose is left to fold as plain #3441 does.
+                            held_text = fold_txt + "".join((e.text or "") for e in fold_buf[1:])
+                            m = _BACKFILL_OPENER.search(held_text)
+                            wrong = m.group(2).strip() if m else ""
+                            right = (_backfill_target(wrong, [nm for nm in parser.schemas if nm])
+                                     if wrong else None)
+                            if (right and parser.unread == backfill_acted + 1
+                                    and backfill_acted < self.undeclared_backfill):
+                                teacher = held_text[:m.start(2)] + right + held_text[m.end(2):m.end(3)]
+                                extra = self.tok.encode(teacher, parse_special=True, plain=[(0, len(teacher))])
+                                cut_c = "".join(seg_text[:fold_at]).rfind(CALL_START)
+                                cum, kept_k, ok_cut = (0, 0, True) if cut_c == 0 else (0, 0, False)
+                                for i2 in range(min(fold_at, len(seg_text))):
+                                    cum += len(seg_text[i2])
+                                    if cum == cut_c:
+                                        kept_k, ok_cut = i2 + 1, True
+                                        break
+                                    if cum > cut_c:
+                                        break
+                                if ok_cut and max_new - n - len(extra) >= 1:
+                                    backfill_acted += 1
+                                    parser.backfills += 1
+                                    print(f"[strata] the reply called {wrong}, which this request did not "
+                                          f"declare: the name was backfilled to {right} and the model goes on "
+                                          f"from it (undeclared_backfill {backfill_acted})", flush=True)
+                                    for t in extra:
+                                        n += 1
+                                        raw_ids.append(t)
+                                        thinking_n += parser.state in ("reasoning", "rcall")
+                                        evs = cut(parser.feed(detok.push(t)))
+                                        self._note(n, evs, st, rate)
+                                        for ev in evs:
+                                            yield "event", ev
+                                    fold_buf = []              # the held wrong-name text never reached the client
+                                    prompt = prompt + seg[:kept_k] + extra
+                                    finish = "length"
+                                    continue
+                        for ev in fold_buf:                 # a stopped pass's held fold text the hook did not claim (local patch)
+                            yield "event", ev
+                        fold_buf = []
                         if not (wrap or opens or quoted) or cancel.is_set():
                             break
                         # #123: the thinking reached reasoning_budget_tokens.  Close it the way the model would (a
@@ -6788,6 +6942,8 @@ class Service:
                             finish = "stop"
                             break
                         prompt = prompt + seg + extra
+                    for ev in fold_buf:                 # local backfill patch: held fold text no path claimed (a break before the hook's flush)
+                        yield "event", ev
                     if cancel.is_set():
                         finish = "cancel"
                     elif looped:
@@ -6932,14 +7088,19 @@ class Service:
             self.totals["tool_args_repaired"] = self.totals.get("tool_args_repaired", 0) + len(parser.notes)
             print(f"[strata] {len(parser.notes)} tool call argument(s) repaired: {'; '.join(sorted(set(parser.notes)))}", flush=True)
         rejected = []
-        if parser.unread:
+        folded = parser.unread - getattr(parser, "backfills", 0)   # local backfill patch: a corrected fold did not go back as text
+        if folded:
             named = getattr(parser, "unread_names", None)
-            print(f"[strata] {parser.unread} <tool_call> block(s) in the answer did not read as a call of a declared "
+            if named and parser.backfills:
+                named = named[:len(named) - min(parser.backfills, len(named))]   # the backfilled folds are the last ones
+            print(f"[strata] {folded} <tool_call> block(s) in the answer did not read as a call of a declared "
                   "tool and went back as text (a name the request did not declare, or a form the template does "
                   "not use)" + (f"; the names the model wrote: {', '.join(named)}" if named else "")
+                  + (f"; the undeclared-name backfill ran {backfill_acted} time(s) and the turn went on to complete "
+                     f"{parser.calls} declared call(s)" if backfill_acted else "")
                   + "; the response carries them as strata_rejected_tool_calls, /metrics counts them", flush=True)
             with self.status_lock:
-                self.totals["tool_calls_unread"] = self.totals.get("tool_calls_unread", 0) + parser.unread
+                self.totals["tool_calls_unread"] = self.totals.get("tool_calls_unread", 0) + folded
             # #3796: the same names for the client (a machine-readable marker next to the text, which stays as the model wrote it)
             rejected = [{"name": nm, "reason": "undeclared"} for nm in named or []]
         if stops is not None and stops.hit is None and stops.held:
@@ -10446,12 +10607,13 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     # the run config's env block feeds the ENGINE's environment; the traffic-class switches (serve/class_profile.py)
     # must be visible to serve itself too, and the unit should not carry a knob that lives in the run config:
     # mirror it into our own environment and re-read CLASS_POLICY (import-time, before the config was in hand)
-    for _k in ("STRATA_CLASS_POLICY", "STRATA_CLASS_PROFILE_MAX", "STRATA_CLASS_PROFILE_PATH"):
+    for _k in ("STRATA_CLASS_POLICY", "STRATA_CLASS_PROFILE_MAX", "STRATA_CLASS_PROFILE_PATH", "STRATA_UNDECLARED_BACKFILL"):
         _v = (cfg.get("env") or {}).get(_k)
         if _v is not None:
             os.environ[_k] = str(_v)
-    global CLASS_POLICY
+    global CLASS_POLICY, UNDECLARED_BACKFILL_MAX
     CLASS_POLICY = max(0, min(2, int(os.environ.get("STRATA_CLASS_POLICY", "0") or 0)))
+    UNDECLARED_BACKFILL_MAX = undeclared_backfill_setting()   # the same re-read for the local backfill patch
 
     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
                   model_name=default_model_name(cfg), vision=vision,
@@ -10484,6 +10646,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         svc.requested_slots = per_replica * len(groups) if groups else per_replica
     svc.answer_room = cfg.get("answer_room") is not False
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
+    svc.undeclared_backfill = UNDECLARED_BACKFILL_MAX   # local patch, env-gated (STRATA_UNDECLARED_BACKFILL)
     if cfg.get("images"):                               # image generation (serve/images.py), set up by setup --images
         icfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                     if k in ("exe", "diffusion_model", "vae", "llm", "out_dir") and isinstance(v, str)
@@ -10576,6 +10739,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     svc.anthropic_think_unasked = mode == "model"
     svc.tool_call_recovery = tool_call_recovery_setting(cfg)
     svc.undeclared_tool_calls = undeclared_tool_calls_setting(cfg)
+    svc.undeclared_backfill = undeclared_backfill_setting(cfg.get("undeclared_backfill"))   # local patch
     etu = cfg.get("env_to_user", False)                # opt-in: see frontend._env_to_user
     if not isinstance(etu, bool):
         raise SystemExit(f"[strata] config \"env_to_user\" must be true or false, not {etu!r}")

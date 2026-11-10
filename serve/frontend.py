@@ -1995,7 +1995,12 @@ class OutputParser:
                         self.unread += 1                 # logged by the server: otherwise "the model ignored my tool" is the only clue
                         if len(self.unread_names) < 5:
                             self.unread_names.append(after[len(FUNC_START):gt].strip()[:80])
-                        out.append(Event("content", self._track(self.buf[:i + len(CALL_START)])))
+                        fold = Event("content", self._track(self.buf[:i + len(CALL_START)]))
+                        # local backfill patch: the fold event carries the name it folded on .folded - the server's
+                        # run() holds this event (and the text that follows to the end of the pass) out of the
+                        # stream while a correction is possible, and the pass-end hook reads the name off it.
+                        fold.folded = after[len(FUNC_START):gt].strip()[:80]
+                        out.append(fold)
                         self.buf = self.buf[i + len(CALL_START):]
                         continue
                 if i and self.buf[:i].strip():
