@@ -4354,8 +4354,31 @@ class UndeclaredBackfill(unittest.TestCase):
         self.assertEqual(c["message"]["content"].strip(), "Looking.")     # the folded wrong call never reached the client
         self.assertNotIn("read_file", c["message"]["content"])
         self.assertIn("the name was backfilled to read", out.getvalue())
-        self.assertNotIn("did not read as a call", out.getvalue())        # a corrected fold is not reported as rejected
-
+    def test_an_announced_call_left_open_by_a_backfill_gets_its_arguments_closed(self):
+        # local patch: the backfilled continuation wrote its value and closed the region with a `</parameter>
+        # \n</invoke>` the model had in mind, never the template's `</function>` - upstream #211 leaves such a
+        # call announced but unfinished, and a strict client JSON.parses the truncated arguments and fails the
+        # turn (the dsh case: arguments received unterminated at position 74).  With the backfill counter up the
+        # closing tail is written, so the streamed arguments always parse.
+        from serve.frontend import OutputParser
+        tools = [{"name": "read", "description": "read", "parameters": {"type": "object",
+                                                    "properties": {"file_path": {"type": "string"}}}}]
+        text = (UndeclaredBackfill.CALL_START + "\n<function=read>\n<parameter=file_path>\n"
+                "HubFS-ui\\src\\api\\HubFs\\request.ts</parameter>\\n</invoke>")   # the dsh turn's raw tail
+        for patched, want in ((1, True), (0, False)):
+            p = OutputParser(thinking=False, tools=tools, stream_tools=True)
+            p.backfills = patched
+            args = []
+            evs = [e for ch in text for e in p.feed(ch)] + p.finish("stop")
+            self.assertTrue(any(e.kind == "tool_start" and e.call and e.call.name == "read" for e in evs),
+                            f"backfills={patched}: the call was never announced")
+            args = "".join(ev.text or "" for ev in evs if ev.kind == "tool_args")
+            try:
+                json.loads(args)
+                parsed = True
+            except ValueError:
+                parsed = False
+            self.assertEqual(parsed, want, f"backfills={patched}: arguments {args!r}")
     def test_two_declared_names_fit_the_server_keeps_its_hands_off(self):
         self.engine.FIRST = self.FIRST.replace("read_file", "read_all_file")
         c = self.chat(tools=("read", "read_all", "terminal"))

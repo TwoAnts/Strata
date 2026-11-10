@@ -6408,6 +6408,7 @@ class Service:
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
         quotes = 0                                      # quoted markers written back and gone on from (bounded)
         backfill_acted = 0                              # the undeclared-name backfills used this turn (local patch)
+        backfill_diag = False                           # local patch: one journal line for what the model went on to write after a backfill
         fold_buf, fold_at, fold_txt = [], None, ""      # local backfill patch: the held text of a folded call, and where its tokens start
         fold_ok, fold_mark, fold_mode = True, False, False   # whether a correction can apply / this pass folded / the run is holding text
         last_stop, stop_run = None, 0                   # the same stop token, written back again and again with
@@ -6831,6 +6832,11 @@ class Service:
                                 finish = "length"
                                 continue
 
+                        if backfill_diag:               # local patch: the raw continuation the model went on with
+                            went = "".join(seg_text)[:140]
+                            print(f"[strata] the model went on with: {went!r}", flush=True)
+                            backfill_diag = False
+
                         if (self.undeclared_backfill and declared_only and self.undeclared_tool_calls == "text"
                                 and fold_ok and fold_at is not None and finish == "stop" and tools
                                 and not cancel.is_set() and (stops is None or stops.hit is None)):
@@ -6864,6 +6870,7 @@ class Service:
                                 if ok_cut and max_new - n - len(extra) >= 1:
                                     backfill_acted += 1
                                     parser.backfills += 1
+                                    backfill_diag = True
                                     print(f"[strata] the reply called {wrong}, which this request did not "
                                           f"declare: the name was backfilled to {right} and the model goes on "
                                           f"from it (undeclared_backfill {backfill_acted})", flush=True)

@@ -2114,6 +2114,12 @@ class OutputParser:
                 out.append(Event("tool_call", call=call))
             elif self.ss == "function_done":
                 out.append(Event("content", self._track(CALL_START + self.buf)))
+            elif self.ss != "done" and getattr(self, "backfills", 0):
+                # local backfill patch: an announced call left open at the end of the output (a `</invoke>` where
+                # `</function>` was due closes nothing) stays unfinished upstream (#211): strict clients JSON.parse
+                # the truncated arguments and fail the turn.  The closing tail _close_scan would have written makes
+                # them parse - the tool runs with a dirty value instead of the request dying.
+                out += self._close_scan()
             self.buf = ""
             self._reset_scan()
             return out
