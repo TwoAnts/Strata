@@ -4279,6 +4279,123 @@ class ReasoningCloseRetry(unittest.TestCase):
         self.assertEqual(c["message"]["reasoning_content"], 'two plus two is "4"')
 
 
+class UndeclaredAsk(unittest.TestCase):
+    """The local STRATA_UNDECLARED_ASK patch: a reply that ends on a call of a name the request did not declare
+    is shown the declared list once and given a round to correct itself, instead of the call folding into text.
+    With the patch off (the default) the #3441 behaviour stands: the call text is the answer."""
+
+    from serve.frontend import CALL_END, CALL_START   # this template's call region markers (as in #3075)
+    CALL = (CALL_START + "\n<function=read_file>\n<parameter=path>\na.txt\n</parameter>\n"
+            "</function>\n" + CALL_END + "\n")
+    FIRST = "Looking.</think>\n\n" + CALL   # the #3441 reply: thinking closed, then a call of an undeclared name
+
+    class AskEngine(MockEngine):
+        """The first pass writes the call of the undeclared name and stops; every later pass writes the engine's
+        NEXT - the model's reply once it has been shown the list (an answer, a corrected call, or the same call)."""
+        NEXT = "The file was read.\n"
+
+        def __init__(self, tok):
+            super().__init__(tok, "x", max_context=CTX)
+            self.prompts = []
+            self.passes = 0
+
+        def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+            self.prompts.append(list(ids))
+            text = UndeclaredAsk.FIRST if self.passes == 0 else self.NEXT
+            self.passes += 1
+            for tok in (self.tok.encode(text) + self.tok.encode("<|im_end|>", parse_special=True))[:max_new]:
+                if cancel.is_set():
+                    return
+                yield tok
+
+    def setUp(self):
+        self.tok = ByteTokenizer()
+        self.engine = self.AskEngine(self.tok)
+        self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.svc.undeclared_ask = True
+        self.httpd = serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def chat(self, tools=("terminal", "write_file")):
+        body = {"model": "m", "messages": [{"role": "user", "content": "read a.txt"}], "max_tokens": 600,
+                "tools": [{"type": "function",
+                           "function": {"name": n, "description": n,
+                                        "parameters": {"type": "object", "properties": {}}}} for n in tools]}
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode())["choices"][0]
+
+    def test_off_by_default_the_call_folds_into_text(self):
+        self.svc.undeclared_ask = False
+        c = self.chat()
+        self.assertEqual(len(self.engine.prompts), 1)
+        self.assertEqual(c["finish_reason"], "stop")
+        self.assertIn("read_file", c["message"]["content"])
+
+    def test_the_ask_shows_the_list_and_gives_the_turn_another_round(self):
+        c = self.chat()
+        self.assertEqual(len(self.engine.prompts), 2)
+        shown = self.tok.decode(self.engine.prompts[1])
+        self.assertIn('No tool "read_file".', shown)
+        self.assertIn("write_file, terminal", shown)         # ordered by closeness: write_file is nearer read_file
+        self.assertNotIn("read_file", shown.split("Tools:")[1].split(".")[0])   # the list itself has no read_file
+        self.assertIn('No tool "read_file"', c["message"]["content"])           # the client sees the words in the reply
+        self.assertTrue(c["message"]["content"].strip().endswith("The file was read."))
+
+    def test_a_request_without_declared_tools_has_no_list_to_show(self):
+        c = self.chat(tools=())
+        self.assertEqual(len(self.engine.prompts), 1)         # nothing to ask with: the text fold stands
+
+    def test_the_cap_holds_when_the_model_repeats_the_mistake(self):
+        self.engine.NEXT = UndeclaredAsk.CALL                 # it writes the very same undeclared call again
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            c = self.chat()
+        self.assertEqual(len(self.engine.prompts), 2)         # asked once at the default cap, then it ends
+        self.assertEqual(c["finish_reason"], "stop")
+        self.assertIn("the undeclared-name ask ran 1 time(s) and the turn went on to complete 0 declared call(s)",
+                      out.getvalue())                          # the warning says: asked, and still no real call
+
+    def test_a_corrected_call_reaches_the_client_as_a_tool_call(self):
+        from serve.frontend import CALL_END, CALL_START
+        self.engine.NEXT = (CALL_START + "\n<function=terminal>\n<parameter=cmd>\nls\n</parameter>\n"
+                            "</function>\n" + CALL_END + "\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            c = self.chat()
+        self.assertEqual(len(self.engine.prompts), 2)
+        self.assertEqual(c["finish_reason"], "tool_calls")
+        self.assertEqual(c["message"]["tool_calls"][0]["function"]["name"], "terminal")
+        self.assertIn("complete 1 declared call(s)", out.getvalue())   # asked, and the model went on to call for real
+
+    def chat_history_call(self):
+        """A history assistant turn already called read_file - does #4663's history rescue still leave it undeclared?"""
+        body = {"model": "m", "max_tokens": 600,
+                "messages": [{"role": "user", "content": "read a.txt"},
+                             {"role": "assistant", "content": None,
+                              "tool_calls": [{"id": "c1", "type": "function",
+                                              "function": {"name": "read_file", "arguments": "{}"}}]},
+                             {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+                             {"role": "user", "content": "read it again"}],
+                "tools": [{"type": "function", "function": {"name": "terminal", "description": "t",
+                                                             "parameters": {"type": "object", "properties": {}}}}]}
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode())["choices"][0]
+
+    def test_a_name_the_history_already_called_is_rescued_and_never_asked(self):
+        c = self.chat_history_call()
+        self.assertEqual(len(self.engine.prompts), 1)          # #4663 rescues it: declared, no ask, no text fold
+        self.assertEqual(c["finish_reason"], "tool_calls")
+        self.assertEqual(c["message"]["tool_calls"][0]["function"]["name"], "read_file")
+
+
 class ThinkingBudget(unittest.TestCase):
     """#123: reasoning_budget_tokens (opt-in): at the budget the thinking is wrapped up and the model answers,
     continuing from the prompt plus what it generated plus the wrap-up (a prefix the engine already holds)."""

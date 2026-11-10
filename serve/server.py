@@ -245,6 +245,39 @@ REASONING_CLOSE = "\n</think>\n\n"
 # the model answers instead of ending on its own marker again.  A pass after the note that ends the same
 # way ends the turn as it always did (run_hinted blocks a second note).
 RUN_HINT = "\n\nNeed continue thinking carefully.\n"
+# Local patch, the undeclared-name ask (env STRATA_UNDECLARED_ASK=1, or =2 to allow two rounds): when a Chat
+# Completions reply ends on a well-formed call of a name the request did not declare (#3441), the server does not
+# fold that call into text where it stands - it shows the model the declared list as an ordinary sentence (plain
+# text like RUN_HINT, so it becomes part of the reply the client keeps) and gives it a round to correct itself.
+# A wrong name is the model's mistake to fix, not the server's to guess, and the retry is not a replay: the hint
+# adds the very information the miss was missing.  Off by default - strict parsing stays the baseline - and the
+# undeclared_tool_calls config (#4622) still disposes of anything the asking did not settle.
+def undeclared_ask_setting() -> tuple:
+    """env STRATA_UNDECLARED_ASK: "" off (the default), "1" ask once, "2" ask at most twice."""
+    v = (os.environ.get("STRATA_UNDECLARED_ASK") or "").strip().lower()
+    return (v in ("1", "2"), 2 if v == "2" else 1)
+
+
+UNDECLARED_ASK_ON, UNDECLARED_ASK_MAX = undeclared_ask_setting()
+
+def _name_distance(a: str, b: str) -> int:
+    """The ask patch's ordering: how far one tool name is from another (Levenshtein, tiny strings, no deps)."""
+    if a == b:
+        return 0
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+# The asking sentence, kept as short as it can be: the first live fires showed the model answering in prose
+# over a long paragraph (and the right name buried among two dozen), so the list is ordered by closeness to
+# the name the model wrote and the sentence says no more than "no such tool, pick one, or answer".
+UNDECLARED_ASK_HINT = '\nNo tool "{name}". Tools: {names}. Call one or answer in text.\n'
+
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
 # #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
 # "reasoning_loop_recovery": "stop" ends the reply there; "recover" (or true) goes on from the same output with the
@@ -4838,6 +4871,8 @@ class Service:
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.answer_room = True                       # 0.1.45: see ANSWER_ROOM_MIN_CAP (the config's "answer_room": false turns it off)
         self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends inside it
+        self.undeclared_ask = False                     # env STRATA_UNDECLARED_ASK (local patch): a reply that ends on a call of an undeclared name is shown the declared list and asked to correct it
+        self.undeclared_ask_max = 1                     # the env value "2" raises the cap to two asks
         self.codex_compaction_cache = False           # #924 (opt-in): a Codex compaction is rendered with its conversation's tools
         self.codex_thread_titles = False              # #923 (opt-in): answer Codex's thread-title turns without the engine
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
@@ -6315,6 +6350,24 @@ class Service:
         parser = self.parser_cls(thinking=thinking, tools=with_history_tools(tools, sampling), stream_tools=True,
                                  recover=self.tool_call_recovery, declared_only=declared_only,
                                  deferred=deferred or self.undeclared_tool_calls == "call")   # #4622: opt-in, as for a deferred tool
+        # local ask patch (diagnostics): a thin counting wrapper over this request's parser, so the rejection
+        # warning can say whether the asked-for turn went on to complete a call of a declared name anyway -
+        # that is the difference between "the model corrected itself" and "the model repeated the mistake".
+        _feed, _finish = parser.feed, parser.finish
+        parser.calls = 0
+        _tallying = [False]
+        def _count(evs):
+            parser.calls += sum(1 for e in evs if e.kind == "tool_call")
+            return evs
+        def _feed_c(text):
+            return _count(_feed(text)) if not _tallying[0] else _feed(text)
+        def _finish_c(reason=None):
+            _tallying[0] = True          # finish() calls self.feed("") inside: count its events once, from here
+            try:
+                return _count(_finish(reason))
+            finally:
+                _tallying[0] = False
+        parser.feed, parser.finish = _feed_c, _finish_c
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
@@ -6353,6 +6406,7 @@ class Service:
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
         quotes = 0                                      # quoted markers written back and gone on from (bounded)
+        ask_acted = 0                                   # the undeclared-ask continuations used this turn (local patch)
         last_stop, stop_run = None, 0                   # the same stop token, written back again and again with
         newline = True                                  # no newline in between (see QUOTED_MARKER_RUN_MAX)
         run_hinted, hint_now = False, False             # the one hinted final pass at RUN_MAX
@@ -6728,6 +6782,39 @@ class Service:
                                 prompt = prompt + seg + extra
                                 finish = "length"
                                 continue
+
+                        if (self.undeclared_ask and declared_only and self.undeclared_tool_calls == "text"
+                                and finish == "stop" and tools and not cancel.is_set()
+                                and (stops is None or stops.hit is None)
+                                and ask_acted < self.undeclared_ask_max and parser.unread > ask_acted
+                                and parser.unread_names):
+                            # local patch (env STRATA_UNDECLARED_ASK): the reply ended on a call of a name this
+                            # request did not declare.  The mistake is the model's to fix, so before folding the
+                            # call into text, show it the declared list and give it a round to correct itself - a
+                            # retry with new information, not a replay of the same context.  The hint is plain
+                            # text like RUN_HINT, so it joins the reply (and the history the client keeps).
+                            ask_acted += 1
+                            decl = [n for n in (t.get("name") for t in tools if isinstance(t, dict)) if n]
+                            wrong = parser.unread_names[-1]
+                            decl.sort(key=lambda n: _name_distance(n.lower(), wrong.lower()))   # closest first
+                            text = UNDECLARED_ASK_HINT.format(name=wrong, names=", ".join(decl[:24])
+                                                               + (", ..." if len(decl) > 24 else ""))
+                            extra = self.tok.encode(text, parse_special=True, plain=[(0, len(text))])
+                            if max_new - n - len(extra) >= 1:
+                                print(f"[strata] the reply called {parser.unread_names[-1]}, which this request "
+                                      "did not declare: the declared tools were shown and the turn goes on "
+                                      f"(undeclared_ask {ask_acted})", flush=True)
+                                for t in extra:
+                                    n += 1
+                                    raw_ids.append(t)
+                                    thinking_n += parser.state in ("reasoning", "rcall")
+                                    evs = cut(parser.feed(detok.push(t)))
+                                    self._note(n, evs, st, rate)
+                                    for ev in evs:
+                                        yield "event", ev
+                                prompt = prompt + seg + extra
+                                finish = "length"
+                                continue
                         if not (wrap or opens or quoted) or cancel.is_set():
                             break
                         # #123: the thinking reached reasoning_budget_tokens.  Close it the way the model would (a
@@ -6937,6 +7024,8 @@ class Service:
             print(f"[strata] {parser.unread} <tool_call> block(s) in the answer did not read as a call of a declared "
                   "tool and went back as text (a name the request did not declare, or a form the template does "
                   "not use)" + (f"; the names the model wrote: {', '.join(named)}" if named else "")
+                  + (f"; the undeclared-name ask ran {ask_acted} time(s) and the turn went on to complete "
+                     f"{parser.calls} declared call(s)" if ask_acted else "")
                   + "; the response carries them as strata_rejected_tool_calls, /metrics counts them", flush=True)
             with self.status_lock:
                 self.totals["tool_calls_unread"] = self.totals.get("tool_calls_unread", 0) + parser.unread
@@ -10446,12 +10535,13 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     # the run config's env block feeds the ENGINE's environment; the traffic-class switches (serve/class_profile.py)
     # must be visible to serve itself too, and the unit should not carry a knob that lives in the run config:
     # mirror it into our own environment and re-read CLASS_POLICY (import-time, before the config was in hand)
-    for _k in ("STRATA_CLASS_POLICY", "STRATA_CLASS_PROFILE_MAX", "STRATA_CLASS_PROFILE_PATH"):
+    for _k in ("STRATA_CLASS_POLICY", "STRATA_CLASS_PROFILE_MAX", "STRATA_CLASS_PROFILE_PATH", "STRATA_UNDECLARED_ASK"):
         _v = (cfg.get("env") or {}).get(_k)
         if _v is not None:
             os.environ[_k] = str(_v)
-    global CLASS_POLICY
+    global CLASS_POLICY, UNDECLARED_ASK_ON, UNDECLARED_ASK_MAX
     CLASS_POLICY = max(0, min(2, int(os.environ.get("STRATA_CLASS_POLICY", "0") or 0)))
+    UNDECLARED_ASK_ON, UNDECLARED_ASK_MAX = undeclared_ask_setting()   # the same re-read for the local ask patch
 
     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
                   model_name=default_model_name(cfg), vision=vision,
@@ -10484,6 +10574,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         svc.requested_slots = per_replica * len(groups) if groups else per_replica
     svc.answer_room = cfg.get("answer_room") is not False
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
+    svc.undeclared_ask, svc.undeclared_ask_max = UNDECLARED_ASK_ON, UNDECLARED_ASK_MAX    # local patch, env-gated (STRATA_UNDECLARED_ASK)
     if cfg.get("images"):                               # image generation (serve/images.py), set up by setup --images
         icfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                     if k in ("exe", "diffusion_model", "vae", "llm", "out_dir") and isinstance(v, str)
